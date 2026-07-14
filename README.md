@@ -1,4 +1,4 @@
-# VRM 虚拟形象舞台
+# VRM 虚拟形象客户端
 
 基于 Vue 3 + Three.js 的 VRM 虚拟形象前端客户端，通过 WebSocket 连接 [AstrBot](https://github.com/Soulter/AstrBot) 后端，实现实时驱动的虚拟主播体验。
 
