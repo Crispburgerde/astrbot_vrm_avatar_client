@@ -40,7 +40,7 @@ export function useEmotion(): EmotionController {
   let current: string | null = null;
   /** 目标情绪；null 表示无情绪 */
   let target: string | null = null;
-  /** 当前情绪的插值权重 0->1 */
+  /** 交叉淡化进度 0->1（0=完全 current，1=完全 target） */
   let blend = 1;
 
   function setValue(name: string, weight: number): void {
@@ -50,40 +50,36 @@ export function useEmotion(): EmotionController {
   function update(dt: number): void {
     if (!manager) return;
 
-    // 无过渡：维持/完成当前情绪的淡入
-    if (target === current) {
-      if (current !== null && blend < 1) {
-        blend = Math.min(1, blend + dt * 5);
-        setValue(current, blend);
-      }
-      return;
-    }
+    // 稳态：权重已就位，无需每帧写入
+    if (target === current) return;
 
-    // 有过渡：先淡出当前情绪
-    if (current !== null) {
-      blend -= dt * 5;
-      if (blend > 0) {
-        setValue(current, blend);
-        return;
-      }
-      setValue(current, 0);
-    }
+    // 交叉淡化：current 权重 1->0，target 权重 0->1，二者不会同时为 0
+    blend = Math.min(1, blend + dt * 5);
+    if (current !== null) setValue(current, 1 - blend);
+    if (target !== null) setValue(target, blend);
 
-    // 切换到目标情绪，开始淡入（目标为 null 时即停留在无情绪）
-    current = target;
-    blend = 0;
-    if (current !== null) {
-      setValue(current, 0);
+    // 进度打满：完成切换
+    if (blend >= 1) {
+      current = target;
     }
   }
 
   function setEmotion(emotion: string): void {
     // 未配置或不在有效集合内 → 目标回退到 idle（neutral 或无情绪）
-    if (validNames === null || !validNames.has(emotion)) {
-      target = idle;
-      return;
+    const next =
+      validNames === null || !validNames.has(emotion) ? idle : emotion;
+    if (next === target) return;
+
+    // 中途打断：清掉旧目标残留权重，避免它停在非 0 值
+    if (target !== current && target !== null) {
+      setValue(target, 0);
     }
-    target = emotion;
+    // 稳态起步：进度归零，从 current 满权重开始交叉淡化
+    // （过渡中打断则保留当前进度，避免 current 权重跳变）
+    if (target === current) {
+      blend = 0;
+    }
+    target = next;
   }
 
   function configure(
@@ -99,7 +95,7 @@ export function useEmotion(): EmotionController {
       emotions.forEach((n) => mgr.setValue(n, 0));
     }
 
-    // 初始即处于 idle 情绪（无过渡，直接拉满权重）
+    // 初始即处于 idle 情绪（无过渡，直接拉到上限权重）
     current = idle;
     target = idle;
     blend = 1;

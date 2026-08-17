@@ -5,8 +5,9 @@ import {
   type WLipSyncAudioNode,
 } from 'wlipsync';
 import type {
+  PerformanceEvent,
   PerformanceMessage,
-  PerformanceSegment,
+  TextChunkEvent,
 } from '@/types/messages';
 import type { LipSyncWeights, VowelPreset } from '@/types/lipsync';
 
@@ -27,9 +28,10 @@ export interface PerformanceSceneApi {
   resetLipWeights: () => void;
   /** 设置当前说话音量（0~1），驱动身体/头部摆动幅度 */
   setAudioLevel: (level: number) => void;
-  /** 按名播放一个动作动画（对应 update_animations 推送的动画 name） */
+  /** 按名播放一个一次性动作动画（对应 update_animations 推送的动画 name）。
+   *  动作在待机动作之上播放一次后自动回归待机 */
   playAction: (name: string) => void;
-  /** 淡出到待机（idle）动作：让循环动作停下来回归待机 */
+  /** 淡出到待机（idle）动作：让进行中的一次性动作停下来回归待机 */
   returnToIdle: () => void;
 }
 
@@ -41,16 +43,21 @@ export interface UsePerformanceOptions {
 }
 
 /**
- * 表演层：维护表演队列，按段顺序播放——切换表情、播放音频、
- * Web Audio 分析音量驱动唇形同步、更新字幕；音频结束后播下一段。
+ * 表演层：按事件顺序消费 performance 事件流——
+ * 遇到 ExpressionTag 立即切换表情（sticky）、遇到 ActionTag 立即触发动作、
+ * 遇到 TextChunk 才更新字幕并播放音频（驱动唇形同步）。
+ * 事件之间无需先折叠成"段"，各自在到达时即时处理。
  */
 export function usePerformance(options: UsePerformanceOptions) {
   const subtitle = ref('');
   const currentExpression = ref('neutral');
   const isPlaying = ref(false);
 
-  const queue: PerformanceSegment[] = [];
+  const queue: PerformanceEvent[] = [];
   let playing = false;
+  /** 最后一个处理的事件是 action 时为 true：队列耗尽后不主动 returnToIdle，
+   *  让场景层的 oneshotFinishListener 在动作自然结束后回归待机 */
+  let justPlayedAction = false;
   let audioCtx: AudioContext | null = null;
   let analyser: AnalyserNode | null = null;
   let gainNode: GainNode | null = null;
@@ -81,17 +88,17 @@ export function usePerformance(options: UsePerformanceOptions) {
     O: 'oh',
   };
 
-  /** 入队一段表演消息 */
+  /** 入队一段表演消息：直接把事件流压入队列，按事件顺序处理 */
   function enqueue(message: PerformanceMessage): void {
+    const events = message.performance.events;
     console.log('[perf] enqueue 收到消息', {
-      segCount: message.segments.length,
+      eventCount: events.length,
       playing,
       queueLenBefore: queue.length,
-      dialogues: message.segments.map((s) => s.dialogue),
-      hasAudios: message.segments.map((s) => !!s.audio),
+      kinds: events.map((e) => e.kind),
     });
-    for (const seg of message.segments) {
-      queue.push(seg);
+    for (const ev of events) {
+      queue.push(ev);
     }
     console.log('[perf] enqueue 入队后', {
       queueLenAfter: queue.length,
@@ -101,8 +108,8 @@ export function usePerformance(options: UsePerformanceOptions) {
   }
 
   async function playNext(): Promise<void> {
-    const seg = queue.shift();
-    if (!seg) {
+    const ev = queue.shift();
+    if (!ev) {
       console.log('[perf] playNext 队列为空，停止播放');
       playing = false;
       isPlaying.value = false;
@@ -110,66 +117,80 @@ export function usePerformance(options: UsePerformanceOptions) {
       currentExpression.value = 'neutral';
       resetLip();
       options.scene.setEmotion('neutral');
-      // 队列结束：让正在循环的动作（如 dance）淡出回归待机
-      options.scene.returnToIdle();
+      // 队列结束：让进行中的一次性动作淡出回归待机。
+      // 但如果最后一个事件本身就是 action，不能立即 returnToIdle——
+      // 否则会把刚触发的动作掐掉。此时交由场景层的 oneshotFinishListener
+      // 在动作自然结束后自动回归待机。
+      if (!justPlayedAction) {
+        options.scene.returnToIdle();
+      }
+      justPlayedAction = false;
       return;
     }
 
     playing = true;
     isPlaying.value = true;
-    const prevExpression = currentExpression.value;
-    currentExpression.value = seg.expression;
-    subtitle.value = seg.dialogue;
-    options.scene.setEmotion(seg.expression);
 
-    // 段指定的动作动画（如 wave/nod）；缺省 action 时回归待机，
-    // 确保上一个循环动作能停下来而不是一直循环
-    if (seg.action) {
-      options.scene.playAction(seg.action);
-    } else {
-      options.scene.returnToIdle();
-    }
-
-    console.log('[perf] playNext 开始播放段', {
-      queueLenAfterShift: queue.length,
-      expression: seg.expression,
-      action: seg.action,
-      hasAudio: !!seg.audio,
-      audioFilename: seg.audio?.filename,
-      audioDataLen: seg.audio?.data?.length,
-      dialogue: seg.dialogue,
-    });
-
-    if (seg.expression !== prevExpression) {
-      try {
-        await delay(EXPRESSION_AUDIO_DELAY);
-      } catch {
-        // skip 在延迟期间取消：结束本段，不再播放音频
-        return;
+    // 按事件类型即时处理：表情/动作标签不需要等 TextChunk，
+    // 到达即生效；只有 TextChunk 才会播放媒体并阻塞到完成。
+    if (ev.kind === 'expression') {
+      justPlayedAction = false;
+      const prevExpression = currentExpression.value;
+      currentExpression.value = ev.name;
+      options.scene.setEmotion(ev.name);
+      console.log('[perf] expression 事件', {
+        name: ev.name,
+        prev: prevExpression,
+      });
+      // sticky 表情切换后缓冲一下，让表情过渡到位再处理后续事件
+      // （通常是紧随其后的 TextChunk 音频）
+      if (ev.name !== prevExpression) {
+        try {
+          await delay(EXPRESSION_AUDIO_DELAY);
+        } catch {
+          // skip 在延迟期间取消：结束本事件，不再处理后续
+          return;
+        }
       }
+      playNext();
+    } else if (ev.kind === 'action') {
+      justPlayedAction = true;
+      // 一次性动作：场景层播放一次后自动回归待机，
+      // 这里的 TextChunk 不干预动作状态——动作与说话并行播放。
+      options.scene.playAction(ev.name);
+      console.log('[perf] action 事件', { name: ev.name });
+      // 动作触发后立即继续，动画与后续 TextChunk 的音频并行
+      playNext();
+    } else {
+      justPlayedAction = false;
+      // TextChunk：只播放媒体（字幕 + 音频/静音）。
+      // 动作状态完全由 ActionTag 的 mode 语义管理，文本段不再触发 returnToIdle。
+      subtitle.value = ev.content;
+      console.log('[perf] text 事件', {
+        content: ev.content,
+        hasAudio: !!ev.audio,
+        audioFilename: ev.audio?.filename,
+        audioDataLen: ev.audio?.data?.length,
+      });
+      await playSegmentMedia(ev);
+      console.log('[perf] text 事件完成，进入下一事件', {
+        queueLenRemaining: queue.length,
+      });
+      playNext();
     }
-
-    // 段播放：播放语音或静音
-    await playSegmentMedia(seg);
-
-    console.log('[perf] playNext 段播放完成，进入下一段', {
-      queueLenRemaining: queue.length,
-    });
-
-    playNext();
   }
 
-  /** 播放段的媒体部分（音频或静音）。 */
-  function playSegmentMedia(seg: PerformanceSegment): Promise<void> {
-    if (seg.audio) return playAudioSegment(seg);
-    return playSilentSegment(seg);
+  /** 播放 TextChunk 的媒体部分（音频或静音）。 */
+  function playSegmentMedia(ev: TextChunkEvent): Promise<void> {
+    if (ev.audio) return playAudioSegment(ev);
+    return playSilentSegment(ev);
   }
 
-  function playAudioSegment(seg: PerformanceSegment): Promise<void> {
+  function playAudioSegment(ev: TextChunkEvent): Promise<void> {
     return new Promise(async (resolve) => {
       cleanupAudio();
 
-      const audio = seg.audio;
+      const audio = ev.audio;
       if (!audio) {
         console.log('[perf] playAudioSegment 无 audio，直接 resolve');
         resolve();
@@ -282,12 +303,12 @@ export function usePerformance(options: UsePerformanceOptions) {
     });
   }
 
-  function playSilentSegment(seg: PerformanceSegment): Promise<void> {
+  function playSilentSegment(ev: TextChunkEvent): Promise<void> {
     return new Promise((resolve) => {
       // 无音频：按文本长度估算展示时长（约每字 180ms，至少 1.2s）
       const duration = Math.max(
         1200,
-        Math.min(8000, charCount(seg.dialogue) * 180),
+        Math.min(8000, charCount(ev.content) * 180),
       );
       silentTimer = window.setTimeout(() => {
         silentTimer = null;
@@ -483,11 +504,12 @@ export function usePerformance(options: UsePerformanceOptions) {
     stopLipLoop();
     playing = false;
     isPlaying.value = false;
+    justPlayedAction = false;
     subtitle.value = '';
     resetLip();
     options.scene.setAudioLevel(0);
     options.scene.setEmotion('neutral');
-    // 跳过时让正在循环的动作淡出回归待机
+    // 跳过时让进行中的一次性动作淡出回归待机
     options.scene.returnToIdle();
   }
 

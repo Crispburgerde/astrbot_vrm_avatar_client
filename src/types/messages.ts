@@ -27,12 +27,11 @@ export interface UpdateBackgroundMessage {
   background: FilePayload;
 }
 
-/** 单个命名动画条目 */
+/** 单个命名动画条目（与 server_reference/messages.py 的 AnimationEntry 对应） */
 export interface AnimationEntry {
   /** 动画名（idle 为待机动画，其余可由 performance 段的 action 引用） */
   name: string;
   file: FilePayload;
-  loop: boolean;
 }
 
 /** 动画更新（连接时或配置变更后推送，可携带多个命名动画） */
@@ -41,22 +40,43 @@ export interface UpdateAnimationsMessage {
   animations: AnimationEntry[];
 }
 
-/** 表演数据：按顺序播放的对话段 */
+/** 表演消息：一次 LLM 回复解析后的事件流容器 */
 export interface PerformanceMessage {
   type: 'performance';
-  segments: PerformanceSegment[];
+  performance: Performance;
 }
 
-export interface PerformanceSegment {
-  /** 对话文本（同时作为字幕） */
-  dialogue: string;
-  /** 表情名（happy/angry/sad/relaxed/surprised/neutral 等可配置值） */
-  expression: string;
-  /** 动作动画别名（对应 update_animations 推送的动画 name，如 wave/nod）；
-   *  缺省时仅保持 idle 循环动画。 */
-  action?: string;
-  /** TTS 音频（可能缺省），结构与 FilePayload 一致 */
+/** 事件流容器（与 server_reference/performance.py 的 Performance 对应） */
+export interface Performance {
+  events: PerformanceEvent[];
+}
+
+/**
+ * 表演事件：按源文本中出现顺序排列；
+ * 消费方需自行维护 sticky 状态（如当前表情）。
+ */
+export type PerformanceEvent =
+  | TextChunkEvent
+  | ExpressionTagEvent
+  | ActionTagEvent;
+
+/** 对话文本段；audio 由 TTS 步骤填充（可能缺省） */
+export interface TextChunkEvent {
+  kind: 'text';
+  content: string;
   audio?: FilePayload;
+}
+
+/** sticky 表情标签：设置当前表情，持续到下一个表情标签 */
+export interface ExpressionTagEvent {
+  kind: 'expression';
+  name: string;
+}
+
+/** 动作标签：按名引用一个已注册的动画，播放一次后回归待机（一次性动作）。 */
+export interface ActionTagEvent {
+  kind: 'action';
+  name: string;
 }
 
 // ---- 消息类型守卫 ----

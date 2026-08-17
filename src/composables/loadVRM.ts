@@ -28,7 +28,7 @@ export async function loadVRMFromBase64(b64: string): Promise<LoadedVRM> {
     throw new Error('未在 GLTF 中找到 VRM 数据');
   }
 
-  // 优化：去除冗余顶点 / 合并骨架
+  // 优化：去除冗余顶点
   VRMUtils.removeUnnecessaryVertices(root);
   VRMUtils.combineSkeletons(root);
   // VRM 0.x 朝向修正

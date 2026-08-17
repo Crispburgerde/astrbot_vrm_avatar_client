@@ -11,42 +11,35 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
-from .performance import parse_performances
+from .performance import (
+    ActionTag,
+    ExpressionTag,
+    Performance,
+    TextChunk,
+    parse_performance,
+)
 from .tts import get_tts_audio
-
-# --- Shared payload models -------------------------------------------------
-
-
-class FilePayload(BaseModel):
-    """A file embedded as a base64 data payload."""
-
-    filename: str
-    data: str
-
+from .wire_types import FilePayload
 
 # --- Message models --------------------------------------------------------
 
 
-class PerformanceSegment(BaseModel):
-    """A single dialogue line with optional expression/action/audio."""
-
-    dialogue: str
-    expression: str
-    action: str | None = None
-    audio: FilePayload | None = None
-
-
 class AnimationEntry(BaseModel):
-    """A named VRMA animation file with its loop flag."""
+    """A named VRMA animation file."""
 
     name: str
     file: FilePayload
-    loop: bool = False
 
 
 class PerformanceMessage(BaseModel):
+    """Wire message wrapping a parsed performance for the VRM client.
+
+    The payload is the :class:`Performance` event stream itself; the client
+    walks the events (text / expression / action) in order.
+    """
+
     type: Literal["performance"] = "performance"
-    segments: list[PerformanceSegment]
+    performance: Performance
 
 
 class UpdateCharacterMessage(BaseModel):
@@ -80,30 +73,31 @@ async def build_performance(
 ) -> PerformanceMessage | None:
     """Parse the LLM output text and build a complete performance message.
 
-    The performances are extracted from ``text`` via :func:`parse_performances`,
-    enriched with TTS audio and wrapped into the message payload expected by the
-    client. Returns ``None`` when no performances could be parsed.
+    The text is parsed via :func:`parse_performance` into an event stream;
+    each :class:`TextChunk` is then enriched with TTS audio (when available).
+    Returns ``None`` when no events could be parsed.
+
+    Args:
+        context: The AstrBot context, used for TTS resolution.
+        tts_provider_id: The configured TTS provider id.
+        text: The raw LLM output text.
     """
-    performances = parse_performances(text)
-    if not performances:
+    performance = parse_performance(text)
+    if performance is None:
         return None
 
-    segments: list[PerformanceSegment] = []
-    for perf in performances:
-        logger.info(
-            f"[Performance] dialogue: {perf.dialogue}, expression: {perf.expression}, action: {perf.action}"
-        )
-        segment = PerformanceSegment(
-            dialogue=perf.dialogue,
-            expression=perf.expression,
-            action=perf.action or None,
-        )
-        audio_result = await get_tts_audio(context, tts_provider_id, perf.dialogue)
-        if audio_result:
-            filename, audio_base64 = audio_result
-            segment.audio = FilePayload(filename=filename, data=audio_base64)
-        segments.append(segment)
-    return PerformanceMessage(segments=segments)
+    for event in performance.events:
+        if isinstance(event, TextChunk):
+            logger.info(f"[Performance] dialogue: {event.content}")
+            audio_result = await get_tts_audio(context, tts_provider_id, event.content)
+            if audio_result:
+                filename, audio_base64 = audio_result
+                event.audio = FilePayload(filename=filename, data=audio_base64)
+        elif isinstance(event, ExpressionTag):
+            logger.info(f"[Performance] expression: {event.name}")
+        elif isinstance(event, ActionTag):
+            logger.info(f"[Performance] action: {event.name}")
+    return PerformanceMessage(performance=performance)
 
 
 async def build_update_character_message(
@@ -165,7 +159,6 @@ async def build_update_animations_message(
                 file=FilePayload(
                     filename=vrma_file.name, data=_encode_file_base64(vrma_file)
                 ),
-                loop=bool(animation.get("loop", False)),
             )
         )
     if not entries:

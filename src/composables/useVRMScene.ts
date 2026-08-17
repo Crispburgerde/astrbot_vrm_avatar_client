@@ -82,19 +82,34 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   const lightHelpers: THREE.Mesh[] = [];
   let helperGeom: THREE.SphereGeometry | null = null;
 
+  // 视线跟随测试球（调试用，当前已停用）：在人物眼前左右往返飞行的微小球体，
+  // 代替摄像机作为 lookAt 注视目标，用于检验视线跟随效果。
+  // 置 true 可重新启用（创建球体并接管视线目标）
+  const GAZE_TEST_ENABLED = false;
+  let gazeTestTarget: THREE.Mesh | null = null;
+  let gazeTestTime = 0;
+  // 球体运动参数：脸部正前方（模型朝 +Z），眼部高度附近
+  const GAZE_TEST_Y = 1.28;
+  const GAZE_TEST_Z = 0.3;
+  const GAZE_TEST_AMP = 0.6; // 左右振幅（米）
+  const GAZE_TEST_SPEED = 2.2; // 角频率（rad/s），周期约 2.9 秒
+
   let currentVrm: VRM | null = null;
   let currentVrmRoot: THREE.Object3D | null = null;
   let bgTexture: THREE.Texture | null = null;
 
   // VRMA 动画：以 name 为键的多个模型无关动画，由后端推送。
   // idle 为待机动画，其余可由 performance 段的 action 字段按名引用。
-  const animationsMap = new Map<string, { vrma: VRMAnimation; loop: boolean }>();
+  // 所有动作均为一次性：播放一次后自动回归待机（见 server_reference/performance.py）。
+  const animationsMap = new Map<string, VRMAnimation>();
   let mixer: THREE.AnimationMixer | null = null;
-  // 当前播放中的动画 action（循环或单次）
+  // 当前播放中的动画 action（待机循环动作或一次性覆盖动作）
   let currentAction: THREE.AnimationAction | null = null;
   // 当前播放中的动画名（'idle'/待机名，或 performance 段的 action 名）。
-  // 用于判断“同一动作”以保持连续播放，避免重复触发导致跳帧。
+  // 用于判断"同一动作"以保持连续播放，避免重复触发导致跳帧。
   let currentActionName: string | null = null;
+  // 当前挂起的 oneshot 结束监听器（被新动作取代或回归待机时需移除）
+  let oneshotFinishListener: (() => void) | null = null;
   // 动作切换 / 回归待机时的交叉淡入淡出时长（秒）
   const FADE_DURATION = 0.3;
 
@@ -188,6 +203,17 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     // 默认隐藏光源辅助球体（仅调试时手动置 visible=true）
     lightHelpers.forEach((m) => (m.visible = false));
 
+    // 视线跟随测试球：自发光微小球体（不受灯光影响，始终清晰可见）。
+    // GAZE_TEST_ENABLED = false 时不创建，视线目标自动回退为摄像机
+    if (GAZE_TEST_ENABLED) {
+      gazeTestTarget = new THREE.Mesh(
+        new THREE.SphereGeometry(0.02, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0x40ffff }),
+      );
+      gazeTestTarget.position.set(0, GAZE_TEST_Y, GAZE_TEST_Z);
+      scene.add(gazeTestTarget);
+    }
+
     // 响应式 → three.js 灯光对象同步
     watch(ambientIntensity, (v) => {
       if (ambient) ambient.intensity = v;
@@ -254,6 +280,12 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     // 轨道摄像机阻尼更新
     controls?.update();
 
+    // 视线跟随测试球：在人物眼前左右往返飞行
+    if (gazeTestTarget) {
+      gazeTestTime += dt;
+      gazeTestTarget.position.x = Math.sin(gazeTestTime * GAZE_TEST_SPEED) * GAZE_TEST_AMP;
+    }
+
     // 表情平滑过渡
     emotion.update(dt);
     // 自然眨眼
@@ -267,7 +299,6 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     if (mixer) mixer.update(dt);
 
     if (currentVrm) {
-      // VRM 必须每帧调用 update（驱动 spring bone / lookAt 等）
       currentVrm.update(dt);
     }
 
@@ -286,10 +317,10 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     currentVrm = vrm;
     currentVrmRoot = vrmRoot;
 
-    // 视线跟踪：让角色注视摄像机
+    // 视线跟踪：注视视线跟随测试球（临时替代摄像机，用于测试视线跟随效果）
     const la = vrm.lookAt;
     if (la) {
-      la.target = camera;
+      la.target = gazeTestTarget ?? camera;
       la.autoUpdate = true;
 
       // 诊断：静态属性需通过 constructor 读取
@@ -297,13 +328,22 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
       const applierType = applier?.constructor?.type ?? 'none';
       // eslint-disable-next-line no-console
       console.log(
-        `[VRM] lookAt: 已启用（跟踪摄像机）, ` +
+        `[VRM] lookAt: 已启用（跟踪注视目标）, ` +
           `applier=${applierType}, autoUpdate=${la.autoUpdate}`,
       );
     } else {
       // eslint-disable-next-line no-console
       console.warn('[VRM] lookAt: 该模型不含视线跟踪数据，无法启用视线跟随');
     }
+
+    // 修复：Koikatu 等模型的眼部由多层近平面网格叠成（眼白 sirome + 瞳孔 hitomi），
+    // 全是 BLEND + transparentWithZWrite=false，three.js 透明排序只按质心距离，
+    // 这些近平面网格距离相近 → 排序不稳定 → 摄像机侧转时白色眼白错误画到瞳孔前，
+    // 视觉上瞳孔被眼白覆盖（"变白"）。Unity 无此问题因其渲染器对透明队列处理不同。
+    // 修复策略：按材质名识别瞳孔(hitomi/iris)层，提高其 renderOrder，强制后于眼白绘制，
+    // 使其稳定地画在眼白之上。对不含此类分层的模型无副作用。
+    // 同时为 hitomi 启用 depthWrite，从根本上消除与眼白的排序竞争。
+    fixEyeRenderOrder(vrmRoot);
 
     // 提取模型内嵌表情名（过滤口型/眨眼/视线等功能性表情）
     const exprMap = vrm.expressionManager?.expressionMap ?? {};
@@ -313,6 +353,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     blink.configure(vrm.expressionManager);
     // 配置情绪：注入 manager 与模型内嵌的情绪表情名，重置为无情绪
     emotion.configure(vrm.expressionManager, exprNames);
+
     // 配置呼吸：在 chest 父级插入 Offset 节点（模型无 chest 骨骼时自动跳过）。
     // 传入当前持久化的胸腔/肩部幅度。
     breath.configure(vrm.humanoid, {
@@ -337,6 +378,38 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
 
     // 模型切换后重新绑定已保存的 VRMA 动画（恢复 idle 默认循环）
     setupAnimations();
+  }
+
+  /**
+   * 修复 Koikatu 等模型瞳孔被眼白覆盖的透明排序问题。
+   *
+   * 这些模型的眼部由近平面网格叠成：眼白(sirome) + 瞳孔/虹膜(hitomi)，
+   * 材质全为 BLEND + transparentWithZWrite=false，three.js 透明排序只按质心距离，
+   * 近平面网格间距离相近 → 排序不稳定 → 摄像机侧转时眼白错误画到瞳孔前。
+   *
+   * 做法：按材质名识别瞳孔层（hitomi/iris/pupil），为其所在 Mesh 提高 renderOrder，
+   * 强制后于眼白绘制；并开启 depthWrite，用深度缓冲稳定遮挡关系。
+   * 仅作用于瞳孔相关材质，对其他模型/网格无副作用。
+   */
+  function fixEyeRenderOrder(root: THREE.Object3D): void {
+    // 瞳孔/虹膜材质名特征（Koikatu 用 hitomi，通用模型常用 iris/pupil/eye）
+    const PUPIL_RE = /hitomi|iris|pupil/i;
+    root.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      const mat = obj.material;
+      const match = (Array.isArray(mat) ? mat : [mat]).some((m) =>
+        PUPIL_RE.test(m.name),
+      );
+      if (!match) return;
+      // 提高瞳孔层渲染顺序（透明队列内数值越大越后绘制 → 画在更上层）
+      obj.renderOrder = (obj.renderOrder || 0) + 1;
+      // 启用深度写入，使瞳孔能被正确遮挡测试，消除与眼白的排序竞争
+      const materials = Array.isArray(mat) ? mat : [mat];
+      materials.forEach((m) => {
+        m.depthWrite = true;
+        m.needsUpdate = true;
+      });
+    });
   }
 
   /** 基于模型包围盒自动取景为半身像 */
@@ -408,7 +481,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     }
 
     mixer = new THREE.AnimationMixer(currentVrmRoot);
-    const clip = createVRMAnimationClip(standby.vrma, currentVrm);
+    const clip = createVRMAnimationClip(standby, currentVrm);
     if (clip) {
       currentAction = mixer.clipAction(clip);
       // 待机动画必须持续循环：忽略来源 loop 配置，
@@ -430,9 +503,9 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
       try {
         const vrmas = await loadVRMAFromBase64(entry.file.data);
         if (vrmas[0]) {
-          animationsMap.set(entry.name, { vrma: vrmas[0], loop: entry.loop });
+          animationsMap.set(entry.name, vrmas[0]);
           // eslint-disable-next-line no-console
-          console.log(`[VRMA] 已加载动画: ${entry.name} (loop=${entry.loop})`);
+          console.log(`[VRMA] 已加载动画: ${entry.name}`);
         }
       } catch (e) {
         console.error(`[VRMA] 动画 "${entry.name}" 加载失败:`, e);
@@ -442,45 +515,58 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   }
 
   /**
-   * 按名播放一个动作动画（由 performance 段的 action 触发）。
-   * - 若与当前正在播放的动作同名且为循环动作，则保持连续播放，不重新触发；
-   * - 否则以交叉淡入淡出切换到新动作；
-   * - 非循环动作播放完毕后自动回归待机动画。
+   * 按名播放一个一次性动作动画（由 performance 段的 action 触发）。
+   * 动作在当前待机动作之上播放一次，结束后自动回归待机。
    */
   function playAction(name: string): void {
     if (!mixer || !currentVrm) return;
-    const entry = animationsMap.get(name);
-    if (!entry) {
+    if (!animationsMap.has(name)) {
       // eslint-disable-next-line no-console
       console.warn(`[VRMA] 未找到动作动画: ${name}`);
       return;
     }
 
-    // 同一个循环动作正在播放：保持连续，不重新触发，避免跳帧/打断
-    if (name === currentActionName && entry.loop && currentAction) {
-      return;
-    }
+    // 一次性动作：覆盖在待机动作之上播放一次
+    clearOneshotListener();
+    switchToAction(name, false);
+    // 非循环动作自然结束后回归待机
+    oneshotFinishListener = (): void => {
+      clearOneshotListener();
+      const target = resolveIdleName();
+      if (!target || target === currentActionName) return;
+      switchToAction(target, true);
+    };
+    mixer.addEventListener('finished', oneshotFinishListener);
+  }
 
-    const clip = createVRMAnimationClip(entry.vrma, currentVrm);
+  /**
+   * 切换到指定名称的动画并交叉淡入淡出。loop=true 时循环播放（待机），
+   * loop=false 时单次播放（一次性动作）。
+   */
+  function switchToAction(name: string, loop: boolean): void {
+    if (!mixer || !currentVrm) return;
+    const vrma = animationsMap.get(name);
+    if (!vrma) return;
+
+    const clip = createVRMAnimationClip(vrma, currentVrm);
     if (!clip) return;
 
     const action = mixer.clipAction(clip);
-    action.loop = entry.loop ? THREE.LoopRepeat : THREE.LoopOnce;
-    action.clampWhenFinished = !entry.loop;
+    action.loop = loop ? THREE.LoopRepeat : THREE.LoopOnce;
+    action.clampWhenFinished = !loop;
     // 当前动作淡出，新动作淡入（交叉过渡）
     fadeOutPrev(currentAction, action);
     action.reset().fadeIn(FADE_DURATION).play();
     currentAction = action;
     currentActionName = name;
+  }
 
-    // 非循环动作结束后回归待机
-    if (!entry.loop) {
-      const onFinished = (): void => {
-        mixer?.removeEventListener('finished', onFinished);
-        returnToIdle();
-      };
-      mixer.addEventListener('finished', onFinished);
+  /** 移除当前挂起的 oneshot 结束监听器（被新动作取代或回归待机时调用） */
+  function clearOneshotListener(): void {
+    if (oneshotFinishListener && mixer) {
+      mixer.removeEventListener('finished', oneshotFinishListener);
     }
+    oneshotFinishListener = null;
   }
 
   /**
@@ -504,32 +590,23 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   }
 
   /**
-   * 淡出到待机（idle）动作。供动作结束、队列结束、skip 调用，
-   * 确保循环动作（如 dance）能够停下来回归待机。
+   * 淡出到待机（idle）动作。
+   * 供队列结束、skip 调用，确保一次性动作能够停下来回归待机。
    */
   function returnToIdle(): void {
     if (!mixer || !currentVrm) return;
     const idleName = resolveIdleName();
-    const idle = idleName ? animationsMap.get(idleName) : undefined;
-    if (!idle) return;
-
+    if (!idleName) return;
+    // 取消任何挂起的 oneshot 回归监听
+    clearOneshotListener();
     // 已在待机：无需切换
     if (currentActionName === idleName && currentAction) return;
-
-    const idleClip = createVRMAnimationClip(idle.vrma, currentVrm);
-    if (!idleClip) return;
-
-    const idleAction = mixer.clipAction(idleClip);
-    // 待机动画强制循环
-    idleAction.loop = THREE.LoopRepeat;
-    fadeOutPrev(currentAction, idleAction);
-    idleAction.reset().fadeIn(FADE_DURATION).play();
-    currentAction = idleAction;
-    currentActionName = idleName ?? null;
+    switchToAction(idleName, true);
   }
 
   /** 停止并释放当前动画混合器 */
   function disposeMixer(): void {
+    clearOneshotListener();
     if (mixer) {
       mixer.stopAllAction();
       mixer = null;
@@ -571,7 +648,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
 
   /**
    * 设置当前说话音量（0~1），由表演层每帧从 wLipSync 归一化音量传入，
-   * 驱动身体/头部摆动幅度。值越大摆动越明显，安静时自动归零。
+   * 驱动身体/头部摆动幅度。值越大效果越明显，安静时自动归零。
    */
   function setAudioLevel(level: number): void {
     bodySway.setAudioLevel(level);
@@ -611,6 +688,13 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     lightHelpers.length = 0;
     helperGeom?.dispose();
     helperGeom = null;
+    // 清理视线跟随测试球
+    if (gazeTestTarget) {
+      scene.remove(gazeTestTarget);
+      gazeTestTarget.geometry.dispose();
+      (gazeTestTarget.material as THREE.Material).dispose();
+      gazeTestTarget = null;
+    }
     if (bgTexture) {
       bgTexture.dispose();
       bgTexture = null;
