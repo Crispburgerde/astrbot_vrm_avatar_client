@@ -18,6 +18,24 @@ import type { LipSyncWeights, VowelPreset } from '@/types/lipsync';
 const AUDIO_WORKLET_URL = '/audio-processor.js';
 const LIPSYNC_PROFILE_URL = '/profile.bin';
 
+/** 静音路径：表情切换到字幕展示的延迟（毫秒），让表情先过渡到位 */
+const EXPRESSION_AUDIO_DELAY = 600;
+
+/** 一场"演出"：一次 performance 消息 = 表演段数组 + 一条共享音频（可缺省） */
+interface Show {
+  performances: Performance[];
+  audio?: PerformanceMessage['audio'];
+}
+
+/** 时间轴上归一化后的段（时间窗必定有效，秒） */
+interface TimedSegment {
+  text: string;
+  emotion: string;
+  intensity: number;
+  start: number;
+  end: number;
+}
+
 export interface PerformanceSceneApi {
   /** 触发情绪表情（24 词表 + 强度 0~1） */
   setEmotion: (emotion: string, intensity?: number) => void;
@@ -39,33 +57,34 @@ export interface UsePerformanceOptions {
 }
 
 /**
- * 表演层：按顺序消费 performance 数组（每项 = 一句台词 + 情绪及其强度）——
- * 每段先切换情绪（仅作用于本段台词，播完自动复位 neutral），再播放媒体
- * （字幕 + 音频驱动唇形同步）。一次性动画触发（action 字段）已在 v1.5 移除。
+ * 表演层（v1.7）：一次 performance 消息 = 一场"演出"——表演段数组 + 一条
+ * 共享 TTS 音频。音频只播一次，客户端依据每段的 start/end 时间窗（服务端
+ * 词级对齐回填；缺失时按文本长度比例估算）在段边界处切换情绪与字幕。
+ * 情绪与字幕在同一段边界同时切换（FaceEngine 临界阻尼自带平滑过渡）。
+ * 无音频时回退逐段静音展示（按文本长度估时）。
+ * 一次性动画触发（action 字段）已在 v1.5 移除。
  */
 export function usePerformance(options: UsePerformanceOptions) {
   const subtitle = ref('');
   const currentEmotion = ref('neutral');
   const isPlaying = ref(false);
 
-  const queue: Performance[] = [];
+  const queue: Show[] = [];
   let playing = false;
-  /** skip/dispose 代数：等待中的段（媒体/延迟等待）据此检测自己已被跳过 */
+  /** skip/dispose 代数：等待中的演出（媒体/延迟等待）据此检测自己已被跳过 */
   let skipGeneration = 0;
   let audioCtx: AudioContext | null = null;
-  let analyser: AnalyserNode | null = null;
   let gainNode: GainNode | null = null;
   let currentAudioEl: HTMLAudioElement | null = null;
   let currentSource: MediaElementAudioSourceNode | null = null;
   let lipsyncNode: WLipSyncAudioNode | null = null;
-  let lipRafId = 0;
+  /** 单一 rAF 循环：口型驱动 + 段时间轴推进 + watchdog 共用 */
+  let rafId = 0;
   let silentTimer: number | null = null;
-  /** 切换表情后、播放音频前的缓冲（让表情先过渡到位） */
+  /** 切换表情后、播放音频前的缓冲（让表情先过渡到位，仅静音路径使用） */
   let expressionDelayTimer: number | null = null;
   /** delay 的 reject 句柄，用于 skip 时取消挂起的延迟 */
   let expressionDelayReject: ((e: Error) => void) | null = null;
-  /** 表情切换到音频播放的延迟（毫秒） */
-  const EXPRESSION_AUDIO_DELAY = 600;
   // 首次手势 unlock 句柄（dispose 时移除）
   let unlockOnce: (() => void) | null = null;
 
@@ -82,17 +101,21 @@ export function usePerformance(options: UsePerformanceOptions) {
     O: 'oh',
   };
 
-  /** 入队一段表演消息：把 performances 压入队列，按顺序处理 */
+  /** 入队一场演出：整条消息（表演段数组 + 共享音频）压入队列，按顺序处理 */
   function enqueue(message: PerformanceMessage): void {
-    const performances = message.performances;
+    const show: Show = {
+      performances: message.performances,
+      audio: message.audio,
+    };
     console.log('[perf] enqueue 收到消息', {
-      count: performances.length,
+      count: show.performances.length,
+      hasAudio: !!show.audio,
+      audioDataLen: show.audio?.data?.length,
       playing,
       queueLenBefore: queue.length,
     });
-    for (const item of performances) {
-      queue.push(item);
-    }
+    if (show.performances.length === 0) return;
+    queue.push(show);
     console.log('[perf] enqueue 入队后', {
       queueLenAfter: queue.length,
       willStartPlayNext: !playing,
@@ -101,8 +124,8 @@ export function usePerformance(options: UsePerformanceOptions) {
   }
 
   async function playNext(): Promise<void> {
-    const item = queue.shift();
-    if (!item) {
+    const show = queue.shift();
+    if (!show) {
       console.log('[perf] playNext 队列为空，停止播放');
       playing = false;
       isPlaying.value = false;
@@ -116,63 +139,34 @@ export function usePerformance(options: UsePerformanceOptions) {
 
     playing = true;
     isPlaying.value = true;
-    // 段落开始时的 skip 代数：任何 await 之后若代数已变，说明本段被
+    // 演出开始时的 skip 代数：任何 await 之后若代数已变，说明本场被
     // skip/dispose 打断，立即终止链路（skip 已完成全部清理）
     const generation = skipGeneration;
 
-    // 情绪：仅在本段台词期间生效（词表外的值由 faceDriver 回退 neutral）
-    const prevEmotion = currentEmotion.value;
-    const emotion = item.emotion || 'neutral';
-    const intensity = item.intensity ?? 0.85;
-    currentEmotion.value = emotion;
-    options.scene.setEmotion(emotion, intensity);
-    console.log('[perf] 情绪', { name: emotion, intensity, prev: prevEmotion });
-
-    // 情绪切换后缓冲一下，让表情过渡到位再播放台词音频
-    if (emotion !== prevEmotion) {
-      try {
-        await delay(EXPRESSION_AUDIO_DELAY);
-      } catch {
-        // skip 在延迟期间取消：结束本段，不再处理后续
-        return;
-      }
+    if (show.audio) {
+      await playAudioShow(show, generation);
+    } else {
+      await playSilentShow(show, generation);
     }
-
-    // 台词：播放媒体（字幕 + 音频/静音），阻塞到完成
-    subtitle.value = item.text;
-    console.log('[perf] text 段', {
-      content: item.text,
-      hasAudio: !!item.audio,
-      audioFilename: item.audio?.filename,
-      audioDataLen: item.audio?.data?.length,
-    });
-    await playSegmentMedia(item);
     if (generation !== skipGeneration) return; // skip 已接管清理，终止链路
-    // 本段结束：情绪作用域结束，复位 neutral
+
+    // 演出结束：情绪作用域结束，复位 neutral
     currentEmotion.value = 'neutral';
     options.scene.setEmotion('neutral');
-    console.log('[perf] text 段完成，情绪复位 neutral，进入下一段', {
+    console.log('[perf] 演出完成，情绪复位 neutral，进入下一场', {
       queueLenRemaining: queue.length,
     });
     playNext();
   }
 
-  /** 播放段的媒体部分（音频或静音）。 */
-  function playSegmentMedia(item: Performance): Promise<void> {
-    if (item.audio) return playAudioSegment(item);
-    return playSilentSegment(item);
-  }
+  // ---- 共享音频路径 ---------------------------------------------------------
 
-  function playAudioSegment(item: Performance): Promise<void> {
+  /** 播放一场带共享音频的演出：音频从头到尾播一次，按时间窗切换情绪/字幕 */
+  function playAudioShow(show: Show, generation: number): Promise<void> {
     return new Promise(async (resolve) => {
       cleanupAudio();
 
-      const audio = item.audio;
-      if (!audio) {
-        console.log('[perf] playAudioSegment 无 audio，直接 resolve');
-        resolve();
-        return;
-      }
+      const audio = show.audio!;
       const fmt = audio.filename.split('.').pop() || 'mp3';
       const mime = audioFormatToMime(fmt);
       const dataUrl = `data:${mime};base64,${audio.data}`;
@@ -183,6 +177,11 @@ export function usePerformance(options: UsePerformanceOptions) {
 
       // 建立 Web Audio 图（持久的 gain→destination 连接只在首次建立）
       await ensureAudioGraph();
+      if (generation !== skipGeneration) {
+        cleanupAudio();
+        resolve();
+        return;
+      }
       let connected = false;
       try {
         const source = audioCtx!.createMediaElementSource(el);
@@ -197,13 +196,32 @@ export function usePerformance(options: UsePerformanceOptions) {
         console.warn('[perf] createMediaElementSource 失败，直接走 audio 元素播放', e);
       }
 
+      // 时间轴：优先用服务端对齐回填的 start/end；缺失/非法时等到拿到
+      // 音频时长后按文本长度比例估算
+      let timeline: TimedSegment[] | null = buildAlignedTimeline(
+        show.performances,
+      );
+      if (!timeline) {
+        const duration = await waitMetadata(el);
+        if (generation !== skipGeneration) {
+          cleanupAudio();
+          resolve();
+          return;
+        }
+        timeline = buildProportionalTimeline(show.performances, duration);
+        console.log('[perf] start/end 缺失，按文本长度比例估算时间轴', {
+          duration,
+          timeline,
+        });
+      }
+      const segments = timeline;
+
       let settled = false;
       const finish = (reason: string): void => {
         if (settled) return;
         settled = true;
-        console.log(`[perf] 段结束（${reason}）`);
-        clearWatchdog();
-        stopLipLoop();
+        console.log(`[perf] 演出结束（${reason}）`);
+        stopLoop();
         resetLip();
         // 音频结束 → 音量归零，让身体/头部摆动随惯性自然停止
         options.scene.setAudioLevel(0);
@@ -219,25 +237,56 @@ export function usePerformance(options: UsePerformanceOptions) {
         finish('error');
       };
 
-      // watchdog：监测 currentTime 是否推进；卡住超过 3s 强制结束。
+      // 段索引状态：-1 表示尚未进入任何段（情绪与字幕共用同一索引，保证同步切换）
+      let segIdx = -1;
+
+      // watchdog：监测 currentTime 是否推进；卡住超过 3s 强制结束
       let lastT = -1;
       let stuckMs = 0;
       let lastTs = performance.now();
-      let watchdogId = 0;
-      const clearWatchdog = (): void => {
-        if (watchdogId) {
-          cancelAnimationFrame(watchdogId);
-          watchdogId = 0;
-        }
-      };
-      const startWatchdog = (): void => {
-        const check = (): void => {
-          watchdogId = requestAnimationFrame(check);
+
+      /**
+       * 单一 rAF 循环：口型驱动 + 时间轴推进 + watchdog。
+       * - 情绪与字幕在同一段边界同时切换（FaceEngine 的临界阻尼自带
+       *   平滑过渡，无需人为提前触发）
+       * - 段间空隙（对齐窗口之间的停顿）保留上一段情绪与字幕，避免闪回 neutral
+       */
+      const startLoop = (): void => {
+        const tick = (): void => {
+          rafId = requestAnimationFrame(tick);
+
+          // 由 wLipSync 驱动五元音口型：weights[phoneme] × volume
+          if (connected && lipsyncNode) {
+            const weights = lipsyncNode.weights;
+            const vol = lipsyncNode.volume;
+            const out: Partial<LipSyncWeights> = {};
+            for (const phoneme in weights) {
+              const vowel = PHONEME_TO_VOWEL[phoneme];
+              if (vowel) out[vowel] = weights[phoneme] * vol;
+            }
+            options.scene.setLipWeights(out);
+            // 同步音量到场景层，驱动身体/头部说话摆动
+            options.scene.setAudioLevel(vol);
+          }
+
+          // 同步音量（用户实时调节）
+          if (gainNode) gainNode.gain.value = options.getVolume();
+          if (currentAudioEl) currentAudioEl.volume = 1; // 实际音量由 gain 控制
+
+          // 时间轴推进：跨过段边界时情绪与字幕一起切换
+          const t = el.currentTime;
+          while (segIdx + 1 < segments.length && t >= segments[segIdx + 1].start) {
+            segIdx++;
+            const seg = segments[segIdx];
+            currentEmotion.value = seg.emotion;
+            options.scene.setEmotion(seg.emotion, seg.intensity);
+            subtitle.value = seg.text;
+          }
+
+          // watchdog
           const now = performance.now();
           const dt = now - lastTs;
           lastTs = now;
-          const t = el.currentTime;
-
           if (t === lastT) {
             stuckMs += dt;
             if (stuckMs >= 3000) {
@@ -253,31 +302,150 @@ export function usePerformance(options: UsePerformanceOptions) {
           }
           lastT = t;
         };
-        watchdogId = requestAnimationFrame(check);
+        rafId = requestAnimationFrame(tick);
       };
+
+      // 首段情绪与字幕在音频起播前一起就位
+      if (segments.length > 0) {
+        segIdx = 0;
+        currentEmotion.value = segments[0].emotion;
+        options.scene.setEmotion(segments[0].emotion, segments[0].intensity);
+        subtitle.value = segments[0].text;
+      }
 
       console.log('[perf] 准备 audioCtx.resume + el.play()', {
         audioCtxState: audioCtx?.state,
         connected,
-        readyState: el.readyState,
-        networkState: el.networkState,
+        segments: segments.map((s) => ({
+          emotion: s.emotion,
+          start: s.start,
+          end: s.end,
+        })),
       });
       audioCtx?.resume().finally(() => {
         el.play()
           .then(() => {
-            console.log('[perf] el.play() 成功，开始唇形循环', {
+            console.log('[perf] el.play() 成功，开始口型/时间轴循环', {
               duration: el.duration,
               connected,
             });
-            if (connected) startLipLoop();
-            startWatchdog();
+            startLoop();
           })
           .catch((err) => {
-            console.error('[perf] el.play() 失败，按静音段处理', err);
+            console.error('[perf] el.play() 失败，本场演出提前结束', err);
             finish('play-rejected');
           });
       });
     });
+  }
+
+  /** 从表演段构建时间轴：全部段都带有效 start/end 才采用（服务端词级对齐结果） */
+  function buildAlignedTimeline(
+    performances: Performance[],
+  ): TimedSegment[] | null {
+    const out: TimedSegment[] = [];
+    let prevEnd = 0;
+    for (const item of performances) {
+      const start = item.start;
+      const end = item.end;
+      if (
+        typeof start !== 'number' ||
+        typeof end !== 'number' ||
+        !Number.isFinite(start) ||
+        !Number.isFinite(end) ||
+        end <= start
+      ) {
+        return null; // 任一段缺失/非法 → 整体回退比例估算
+      }
+      const s = Math.max(start, prevEnd); // 防御：窗口重叠时钳到递增
+      prevEnd = end;
+      out.push({
+        text: item.text,
+        emotion: item.emotion || 'neutral',
+        intensity: item.intensity ?? 0.85,
+        start: s,
+        end,
+      });
+    }
+    return out.length > 0 ? out : null;
+  }
+
+  /** 回退时间轴：无对齐数据时按文本长度比例把段均分到音频时长上 */
+  function buildProportionalTimeline(
+    performances: Performance[],
+    duration: number,
+  ): TimedSegment[] {
+    const weights = performances.map((p) => Math.max(charCount(p.text), 1));
+    const total = weights.reduce((a, b) => a + b, 0);
+    // 时长未知（流式/Infinity）：退回按每字 180ms 估算
+    const span =
+      Number.isFinite(duration) && duration > 0 ? duration : (total * 180) / 1000;
+    let cursor = 0;
+    return performances.map((item, i) => {
+      const dur = (weights[i] / total) * span;
+      const seg = {
+        text: item.text,
+        emotion: item.emotion || 'neutral',
+        intensity: item.intensity ?? 0.85,
+        start: cursor,
+        end: cursor + dur,
+      };
+      cursor += dur;
+      return seg;
+    });
+  }
+
+  /** 等待音频元数据（duration）就绪，超时 3s 返回当前值 */
+  function waitMetadata(el: HTMLAudioElement): Promise<number> {
+    return new Promise((resolve) => {
+      if (el.readyState >= 1 && el.duration > 0) {
+        resolve(el.duration);
+        return;
+      }
+      const timer = window.setTimeout(done, 3000);
+      function done(): void {
+        window.clearTimeout(timer);
+        el.removeEventListener('loadedmetadata', done);
+        resolve(el.duration);
+      }
+      el.addEventListener('loadedmetadata', done);
+    });
+  }
+
+  // ---- 静音路径（无共享音频） ------------------------------------------------
+
+  /** 无音频：逐段静音展示（按文本长度估时），段间保留 600ms 表情过渡缓冲 */
+  async function playSilentShow(show: Show, generation: number): Promise<void> {
+    let prevEmotion = currentEmotion.value;
+    for (const item of show.performances) {
+      const emotion = item.emotion || 'neutral';
+      const intensity = item.intensity ?? 0.85;
+      currentEmotion.value = emotion;
+      options.scene.setEmotion(emotion, intensity);
+      console.log('[perf] 情绪（静音段）', {
+        name: emotion,
+        intensity,
+        prev: prevEmotion,
+      });
+
+      // 情绪切换后缓冲一下，让表情过渡到位再展示字幕
+      if (emotion !== prevEmotion) {
+        try {
+          await delay(EXPRESSION_AUDIO_DELAY);
+        } catch {
+          return; // skip 在延迟期间取消
+        }
+        if (generation !== skipGeneration) return;
+      }
+      prevEmotion = emotion;
+
+      subtitle.value = item.text;
+      console.log('[perf] text 段（静音）', { content: item.text });
+      await playSilentSegment(item);
+      if (generation !== skipGeneration) return;
+      // 段末情绪复位由演出级收尾统一处理；静音多段间短暂回 neutral
+      options.scene.setEmotion('neutral');
+    }
   }
 
   function playSilentSegment(item: Performance): Promise<void> {
@@ -307,7 +475,7 @@ export function usePerformance(options: UsePerformanceOptions) {
     });
   }
 
-  // 进行中的 ensureAudioGraph promise：unlockAudio 与 playAudioSegment
+  // 进行中的 ensureAudioGraph promise：unlockAudio 与 playAudioShow
   // 可能并发触发，重复 createWLipSyncNode / audioWorklet.addModule 会
   // 互相中止并抛 AbortError，这里合并为同一次调用。
   let ensureAudioGraphPromise: Promise<void> | null = null;
@@ -398,42 +566,15 @@ export function usePerformance(options: UsePerformanceOptions) {
   window.addEventListener('pointerdown', unlockOnce);
   window.addEventListener('keydown', unlockOnce);
 
-  function startLipLoop(): void {
-    stopLipLoop();
-    const tick = (): void => {
-      lipRafId = requestAnimationFrame(tick);
-
-      // 由 wLipSync 驱动五元音口型：weights[phoneme] × volume
-      // weights 是平滑后的独立值（命中音素趋近 1，其余趋近 0）
-      if (lipsyncNode) {
-        const weights = lipsyncNode.weights;
-        const vol = lipsyncNode.volume;
-        const out: Partial<LipSyncWeights> = {};
-        for (const phoneme in weights) {
-          const vowel = PHONEME_TO_VOWEL[phoneme];
-          if (vowel) out[vowel] = weights[phoneme] * vol;
-        }
-        options.scene.setLipWeights(out);
-        // 同步音量到场景层，驱动身体/头部说话摆动
-        options.scene.setAudioLevel(vol);
-      }
-
-      // 同步音量（用户实时调节）
-      if (gainNode) gainNode.gain.value = options.getVolume();
-      if (currentAudioEl) currentAudioEl.volume = 1; // 实际音量由 gain 控制
-    };
-    lipRafId = requestAnimationFrame(tick);
-  }
-
   /** 关闭所有口型（段间复位） */
   function resetLip(): void {
     options.scene.resetLipWeights();
   }
 
-  function stopLipLoop(): void {
-    if (lipRafId) {
-      cancelAnimationFrame(lipRafId);
-      lipRafId = 0;
+  function stopLoop(): void {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
     }
   }
 
@@ -479,7 +620,7 @@ export function usePerformance(options: UsePerformanceOptions) {
       reject(new Error('delay-cancelled'));
     }
     cleanupAudio();
-    stopLipLoop();
+    stopLoop();
     playing = false;
     isPlaying.value = false;
     subtitle.value = '';

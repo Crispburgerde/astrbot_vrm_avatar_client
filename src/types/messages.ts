@@ -66,29 +66,39 @@ export interface SetIdleMessage {
   name: string;
 }
 
-/** 表演消息：一次 LLM 回复解析出的有序表演段数组 */
+/**
+ * 表演消息（v1.7）：一次 LLM 回复 = 有序表演段数组 + **一条共享 TTS 音频**。
+ * 音频是数组的兄弟字段而非逐段内嵌：整段回复合成一个音频文件，客户端只播一次，
+ * 依据每段的 start/end 时间窗在段边界处切换情绪与字幕
+ */
 export interface PerformanceMessage {
   type: 'performance';
   performances: Performance[];
+  /** 整次回复的共享 TTS 音频（base64 内嵌）；TTS 未产出时缺省 */
+  audio?: FilePayload;
 }
 
 /**
  * 单个表演段（与 server_reference/performance.py 的 Performance 对应）：
- * 一句台词 + 说这句台词时的情绪及其强度。
+ * 一段台词 + 说这段台词时的情绪及其强度。
  * - emotion 属固定 24 词情绪词表（与前端表情引擎 emotionCatalog 同步），
  *   词表外的值在服务端已降级为 neutral；仅在本段台词播放期间生效，段末复位
- * - intensity 为情绪强度 0~1，缺省 0.85
- * - text 恒非空（服务端跳过空台词段）；audio 由 TTS 步骤填充（可能缺省）
+ * - intensity 为情绪强度 0~1，服务端固定下发默认值 0.85
+ * - text 恒非空（服务端跳过空台词段）
+ * - start / end 为本段在共享音频内的时间窗（秒），由服务端词级对齐步骤回填；
+ *   对齐失败或无音频时为 null，客户端回退按文本长度比例估算
  */
 export interface Performance {
   /** 台词 */
   text: string;
   /** 本段台词期间的情绪（24 词表内） */
   emotion?: string;
-  /** 情绪强度 0~1（缺省 0.85） */
+  /** 情绪强度 0~1（服务端固定默认 0.85） */
   intensity?: number;
-  /** 台词对应的 TTS 音频（base64） */
-  audio?: FilePayload;
+  /** 本段在共享音频内的开始时间（秒），对齐失败时缺省 */
+  start?: number | null;
+  /** 本段在共享音频内的结束时间（秒），对齐失败时缺省 */
+  end?: number | null;
 }
 
 // ---- 消息类型守卫 ----
