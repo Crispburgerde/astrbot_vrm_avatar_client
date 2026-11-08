@@ -2,17 +2,23 @@ import { onBeforeUnmount, ref, watch, type Ref } from 'vue';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { VRMUtils, type VRM } from '@pixiv/three-vrm';
-import { createVRMAnimationClip, type VRMAnimation } from '@pixiv/three-vrm-animation';
+import type { VRMAnimation } from '@pixiv/three-vrm-animation';
 import type { LipSyncWeights, VowelPreset } from '@/types/lipsync';
-import { formatToMime } from '@/lib/utils';
-import { useBlink } from './useBlink';
-import { useEmotion } from './useEmotion';
+import { useFaceDriver, type FaceEmotionState } from '@/emotion/faceDriver';
 import { useBreath } from './useBreath';
 import { useBodySway } from './useBodySway';
-import { loadVRMFromBase64 } from './loadVRM';
-import { loadVRMAFromBase64 } from './loadVRMA';
+import { loadVRM } from './loadVRM';
+import { loadVRMA } from './loadVRMA';
 import { usePersistentRef } from './usePersistentRef';
-import type { AnimationEntry } from '@/types/messages';
+import { AnimationController } from '@/animation/AnimationController';
+import type { AnimationLayer } from '@/types/messages';
+
+/** loadAnimations 的输入条目：命名动画 + 类别 + 已取得的 VRMA 字节 */
+export interface AnimationFileInput {
+  name: string;
+  layer?: AnimationLayer;
+  buffer: ArrayBuffer;
+}
 
 /** 灯光强度持久化存储键 */
 const LIGHT_AMBIENT_KEY = 'vrm.light.ambient';
@@ -98,26 +104,10 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   let currentVrmRoot: THREE.Object3D | null = null;
   let bgTexture: THREE.Texture | null = null;
 
-  // VRMA 动画：以 name 为键的多个模型无关动画，由后端推送。
-  // idle 为待机动画，其余可由 performance 段的 action 字段按名引用。
-  // 所有动作均为一次性：播放一次后自动回归待机（见 server_reference/performance.py）。
-  const animationsMap = new Map<string, VRMAnimation>();
-  let mixer: THREE.AnimationMixer | null = null;
-  // 当前播放中的动画 action（待机循环动作或一次性覆盖动作）
-  let currentAction: THREE.AnimationAction | null = null;
-  // 当前播放中的动画名（'idle'/待机名，或 performance 段的 action 名）。
-  // 用于判断"同一动作"以保持连续播放，避免重复触发导致跳帧。
-  let currentActionName: string | null = null;
-  // 当前挂起的 oneshot 结束监听器（被新动作取代或回归待机时需移除）
-  let oneshotFinishListener: (() => void) | null = null;
-  // 动作切换 / 回归待机时的交叉淡入淡出时长（秒）
-  const FADE_DURATION = 0.3;
-
-  /** 解析待机动画名：优先 'idle'，否则回退到 Map 中的首个条目 */
-  function resolveIdleName(): string | undefined {
-    if (animationsMap.has('idle')) return 'idle';
-    return animationsMap.keys().next().value;
-  }
+  // ---- 分层动画系统 ----
+  // 四层：Base（可切换的基础层）/ Additive（程序化叠加）/ Gesture（上半身遮罩）/
+  //       Action（全身覆盖）。VRMA 动画集由后端推送，name 为键（模型无关）。
+  const animator = new AnimationController();
 
   // 轨道摄像机控制器
   let controls: OrbitControls | null = null;
@@ -125,19 +115,25 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   let rafId = 0;
   let lastTime = performance.now();
 
-  // 情绪过渡（独立的生命感动画层）
-  const emotion = useEmotion();
+  // 表情驱动层（Soullink FaceEngine：情绪/眨眼/头部姿态/视线 + 口型闸门）
+  const face = useFaceDriver();
 
-  // 自然眨眼（独立的生命感动画层）
-  const blink = useBlink();
+  // 情绪状态（VAD 快照，供 UI 展示；渲染循环内 ~10Hz 节流更新）
+  const emotionState = ref<FaceEmotionState | null>(null);
+  let lastEmotionSync = 0;
 
-  // 程序化呼吸（独立的生命感动画层：在 chest 父级插入 Offset 节点叠加正弦波）
+  // 程序化呼吸（Additive 层组件：在 chest 父级插入 Offset 节点叠加正弦波）
   const breath = useBreath();
 
-  // 说话摆动（独立的生命感动画层：音量驱动身体/头部摆动，仅在说话时生效）
+  // 说话摆动（Additive 层组件：音量驱动身体/头部摆动，仅在说话时生效）
   const bodySway = useBodySway();
 
-  // 唇形：由 usePerformance 在每帧更新（五元音权重）
+  // Additive 层注册：呼吸与说话摆动经控制器统一编排——每帧最先应用、
+  // 数学叠加（Offset 节点父子相乘），不覆盖任何关键帧层，Action 期间也保持
+  animator.registerAdditive((dt) => breath.update(dt));
+  animator.registerAdditive((dt) => bodySway.update(dt));
+
+  // 唇形：由 usePerformance 每帧更新，faceDriver 统一写入面部 morph
   const lipWeights: LipSyncWeights = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
 
   function init(): void {
@@ -286,29 +282,38 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
       gazeTestTarget.position.x = Math.sin(gazeTestTime * GAZE_TEST_SPEED) * GAZE_TEST_AMP;
     }
 
-    // 表情平滑过渡
-    emotion.update(dt);
-    // 自然眨眼
-    blink.update(dt);
-    // 程序化呼吸
-    breath.update(dt);
-    // 说话摆动（音量驱动）
-    bodySway.update(dt);
+    // 表情引擎推进（情绪 AU / 眨眼 / 头部姿态 / 视线偏移，内部 120Hz 定步长）
+    face.update(dt);
+    // VAD 快照节流同步到 UI（避免 60Hz 触发响应式更新）
+    if (now - lastEmotionSync > 100) {
+      lastEmotionSync = now;
+      emotionState.value = face.readState();
+    }
 
-    // 动画混合器：驱动 VRMA 关键帧（先于 vrm.update，使骨骼变换先就位）
-    if (mixer) mixer.update(dt);
+    // 还原上一帧的头部姿态偏移（保证无 VRMA 头部轨道时偏移不累积）
+    face.prepareHead();
+
+    // 分层动画控制器：Additive（呼吸/摆动）→ Base → Gesture → Action
+    // （先于 vrm.update，使骨骼变换先就位）
+    animator.update(dt);
+
+    // VRMA 关键帧就位后叠加情绪头部姿态偏移 + 写入视线角度
+    face.applyHead();
 
     if (currentVrm) {
       currentVrm.update(dt);
     }
 
+    // 面部写入放在 vrm.update 之后：直写 morph 覆盖 expressionManager 输出
+    face.applyFace();
+
     renderer?.render(scene, camera);
   }
 
-  /** 加载 base64 编码的 VRM 文件 */
-  async function loadVrmFromBase64(b64: string, filename: string): Promise<void> {
+  /** 加载 VRM 模型（GLB 字节，来源为 HTTP 下载或 base64 解码） */
+  async function loadVrm(buffer: ArrayBuffer, filename: string): Promise<void> {
     // 解析 + 优化（无状态，已抽离到 loadVRM.ts）
-    const { vrm, root: vrmRoot } = await loadVRMFromBase64(b64);
+    const { vrm, root: vrmRoot } = await loadVRM(buffer);
 
     // 清理旧模型
     disposeCurrentVrm();
@@ -317,23 +322,10 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     currentVrm = vrm;
     currentVrmRoot = vrmRoot;
 
-    // 视线跟踪：注视视线跟随测试球（临时替代摄像机，用于测试视线跟随效果）
-    const la = vrm.lookAt;
-    if (la) {
-      la.target = gazeTestTarget ?? camera;
-      la.autoUpdate = true;
-
-      // 诊断：静态属性需通过 constructor 读取
-      const applier = la.applier as { constructor?: { type?: string } } | null;
-      const applierType = applier?.constructor?.type ?? 'none';
-      // eslint-disable-next-line no-console
-      console.log(
-        `[VRM] lookAt: 已启用（跟踪注视目标）, ` +
-          `applier=${applierType}, autoUpdate=${la.autoUpdate}`,
-      );
-    } else {
-      // eslint-disable-next-line no-console
-      console.warn('[VRM] lookAt: 该模型不含视线跟踪数据，无法启用视线跟随');
+    // 视线由 faceDriver 接管（注视摄像机或视线测试球 + 情绪视线偏移）：
+    // lookAt.autoUpdate 关闭，每帧手算方向角写入 yaw/pitch
+    if (vrm.lookAt) {
+      vrm.lookAt.autoUpdate = false;
     }
 
     // 修复：Koikatu 等模型的眼部由多层近平面网格叠成（眼白 sirome + 瞳孔 hitomi），
@@ -345,14 +337,13 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     // 同时为 hitomi 启用 depthWrite，从根本上消除与眼白的排序竞争。
     fixEyeRenderOrder(vrmRoot);
 
-    // 提取模型内嵌表情名（过滤口型/眨眼/视线等功能性表情）
+    // 提取模型内嵌表情名（过滤口型/眨眼/视线等功能性表情；仅作 UI 展示，
+    // 情绪驱动已由 faceDriver 按 morph 绑定接管，不再依赖模型表情名）
     const exprMap = vrm.expressionManager?.expressionMap ?? {};
     const exprNames = Object.keys(exprMap).filter((n) => !UTIL_EXPRESSIONS.has(n));
 
-    // 配置眨眼：检测 manager 是否含眨眼表情（blink / blinkLeft+Right）
-    blink.configure(vrm.expressionManager);
-    // 配置情绪：注入 manager 与模型内嵌的情绪表情名，重置为无情绪
-    emotion.configure(vrm.expressionManager, exprNames);
+    // 绑定表情驱动层：morph 收集 / AU 绑定解析 / lookAt 接管（含测试球目标）
+    face.configure(vrm, gazeTestTarget ?? camera);
 
     // 配置呼吸：在 chest 父级插入 Offset 节点（模型无 chest 骨骼时自动跳过）。
     // 传入当前持久化的胸腔/肩部幅度。
@@ -444,12 +435,10 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     }
   }
 
-  /** 加载 base64 编码的背景图 */
-  function loadBackgroundFromBase64(b64: string, format: string, filename: string): void {
-    const mime = formatToMime(format);
-    const dataUrl = `data:${mime};base64,${b64}`;
+  /** 加载背景图（sourceUrl 为文件下载服务 URL 或 base64 data URL） */
+  function loadBackground(sourceUrl: string, filename: string): void {
     const loader = new THREE.TextureLoader();
-    loader.load(dataUrl, (tex) => {
+    loader.load(sourceUrl, (tex) => {
       tex.colorSpace = THREE.SRGBColorSpace;
       if (bgTexture) {
         bgTexture.dispose();
@@ -465,181 +454,113 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   }
 
   /**
-   * 将待机动画（idle，无 idle 时取首个）绑定到当前 VRM 模型。
-   * 模型缺失时只清理旧 mixer，等模型加载后再绑定。
+   * 将分层动画控制器绑定到当前 VRM 模型（Base 层自动进入待机循环）。
+   * 模型缺失时只清理旧层，等模型加载后再绑定。
    */
   function setupAnimations(): void {
-    disposeMixer();
-    if (!currentVrm || !currentVrmRoot) {
-      return;
+    if (currentVrm && currentVrmRoot) {
+      animator.bind(currentVrm, currentVrmRoot);
+      // eslint-disable-next-line no-console
+      console.log('[Animator] 已绑定分层动画（Base/Gesture/Additive/Action）');
+    } else {
+      animator.unbind();
     }
-
-    const idleName = resolveIdleName();
-    const standby = idleName ? animationsMap.get(idleName) : undefined;
-    if (!standby) {
-      return;
-    }
-
-    mixer = new THREE.AnimationMixer(currentVrmRoot);
-    const clip = createVRMAnimationClip(standby, currentVrm);
-    if (clip) {
-      currentAction = mixer.clipAction(clip);
-      // 待机动画必须持续循环：忽略来源 loop 配置，
-      // 否则 LoopOnce 播完会松开骨骼权重，模型回到 T-pose。
-      currentAction.loop = THREE.LoopRepeat;
-      currentAction.play();
-      currentActionName = idleName ?? null;
-    }
-
-    console.log(`[VRMA] 已绑定待机动画 (强制 loop=true)`);
   }
 
-  /** 解析后端推送的多个命名 VRMA 动画并缓存，随后绑定待机动画。 */
-  async function loadAnimationsFromBase64(
-    entries: AnimationEntry[],
-  ): Promise<void> {
-    animationsMap.clear();
-    for (const entry of entries) {
+  /** 解析后端推送的多个命名 VRMA 动画并注入动画控制器，随后绑定待机动画。
+   *  每个动画的类别（layer）一并保存，[action:x] 即时播放时据此区分路由：
+   *  gesture → Gesture 层上半身遮罩，action → Action 层全身覆盖。 */
+  async function loadAnimations(items: AnimationFileInput[]): Promise<void> {
+    const animationsMap = new Map<string, VRMAnimation>();
+    const layersMap = new Map<string, AnimationLayer>();
+    // layer=idle 的动画即默认待机（服务端声明，客户端不靠命名猜）；没有则用命名约定
+    let idleName: string | undefined;
+    for (const item of items) {
       try {
-        const vrmas = await loadVRMAFromBase64(entry.file.data);
+        const vrmas = await loadVRMA(item.buffer);
         if (vrmas[0]) {
-          animationsMap.set(entry.name, vrmas[0]);
+          const layer = item.layer ?? 'action';
+          animationsMap.set(item.name, vrmas[0]);
+          layersMap.set(item.name, layer);
+          if (layer === 'idle' && idleName === undefined) idleName = item.name;
           // eslint-disable-next-line no-console
-          console.log(`[VRMA] 已加载动画: ${entry.name}`);
+          console.log(`[VRMA] 已加载动画: ${item.name} (layer=${layer})`);
         }
       } catch (e) {
-        console.error(`[VRMA] 动画 "${entry.name}" 加载失败:`, e);
+        console.error(`[VRMA] 动画 "${item.name}" 加载失败:`, e);
       }
     }
+    if (idleName === undefined && animationsMap.has('idle')) idleName = 'idle';
+    animator.setAnimations(animationsMap, layersMap, idleName);
     setupAnimations();
   }
 
   /**
-   * 按名播放一个一次性动作动画（由 performance 段的 action 触发）。
-   * 动作在当前待机动作之上播放一次，结束后自动回归待机。
+   * 按名播放一个一次性动画（[action:x] 事件触发），按该动画注册的 layer 路由：
+   * - gesture → Gesture 层：上半身遮罩（躯干上部/颈/头/肩/臂/手/指 + 表情），
+   *   下半身继续走 Base 层，播完自动交还
+   * - action → Action 层：全身覆盖，触发瞬间静音 Base/Gesture，播完自动释放
    */
   function playAction(name: string): void {
-    if (!mixer || !currentVrm) return;
-    if (!animationsMap.has(name)) {
-      // eslint-disable-next-line no-console
-      console.warn(`[VRMA] 未找到动作动画: ${name}`);
-      return;
-    }
-
-    // 一次性动作：覆盖在待机动作之上播放一次
-    clearOneshotListener();
-    switchToAction(name, false);
-    // 非循环动作自然结束后回归待机
-    oneshotFinishListener = (): void => {
-      clearOneshotListener();
-      const target = resolveIdleName();
-      if (!target || target === currentActionName) return;
-      switchToAction(target, true);
-    };
-    mixer.addEventListener('finished', oneshotFinishListener);
+    animator.playOneShot(name);
   }
 
   /**
-   * 切换到指定名称的动画并交叉淡入淡出。loop=true 时循环播放（待机），
-   * loop=false 时单次播放（一次性动作）。
+   * 等待一次性覆盖层（Gesture/Action）完全空闲：动画播完并结束释放淡出。
+   * 表演层用于段落时序同步——带 action 的段要等动画与台词都结束才进下一段。
+   * 兜底：覆盖层异常忙碌超过 60s 时强制 resolve，避免表演队列卡死
+   * （正常路径有 onFinished / watchdog 保证必然释放）。
    */
-  function switchToAction(name: string, loop: boolean): void {
-    if (!mixer || !currentVrm) return;
-    const vrma = animationsMap.get(name);
-    if (!vrma) return;
-
-    const clip = createVRMAnimationClip(vrma, currentVrm);
-    if (!clip) return;
-
-    const action = mixer.clipAction(clip);
-    action.loop = loop ? THREE.LoopRepeat : THREE.LoopOnce;
-    action.clampWhenFinished = !loop;
-    // 当前动作淡出，新动作淡入（交叉过渡）
-    fadeOutPrev(currentAction, action);
-    action.reset().fadeIn(FADE_DURATION).play();
-    currentAction = action;
-    currentActionName = name;
-  }
-
-  /** 移除当前挂起的 oneshot 结束监听器（被新动作取代或回归待机时调用） */
-  function clearOneshotListener(): void {
-    if (oneshotFinishListener && mixer) {
-      mixer.removeEventListener('finished', oneshotFinishListener);
-    }
-    oneshotFinishListener = null;
+  function waitActionDone(): Promise<void> {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      const check = (): void => {
+        if (!animator.isOverlayBusy || performance.now() - start > 60_000) {
+          resolve();
+          return;
+        }
+        requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
+    });
   }
 
   /**
-   * 将上一个动作交叉淡出，并在淡出时长后停止它，避免在 mixer 中累积。
-   * next 为即将淡入的新动作，仅用于避免停止自身。
+   * 切换 Base 层动画（[idle:x] 事件触发，sticky）。
+   * 立即交叉淡化到目标动画；null 恢复默认待机。
    */
-  function fadeOutPrev(
-    prev: THREE.AnimationAction | null,
-    next: THREE.AnimationAction,
-  ): void {
-    if (!prev || prev === next) return;
-    prev.fadeOut(FADE_DURATION);
-    // 淡出完成后停止旧动作，释放 mixer 内的 action（weight 已为 0 不影响渲染）
-    window.setTimeout(() => {
-      try {
-        prev.stop();
-      } catch {
-        /* mixer 可能已销毁，忽略 */
-      }
-    }, FADE_DURATION * 1000 + 60);
+  function setIdle(name: string | null): void {
+    animator.setIdle(name);
   }
 
   /**
-   * 淡出到待机（idle）动作。
-   * 供队列结束、skip 调用，确保一次性动作能够停下来回归待机。
+   * 释放覆盖层回归待机：让进行中的 Action/Gesture 停下来，
+   * 显形为常驻的 Base 待机动画。
    */
   function returnToIdle(): void {
-    if (!mixer || !currentVrm) return;
-    const idleName = resolveIdleName();
-    if (!idleName) return;
-    // 取消任何挂起的 oneshot 回归监听
-    clearOneshotListener();
-    // 已在待机：无需切换
-    if (currentActionName === idleName && currentAction) return;
-    switchToAction(idleName, true);
+    animator.returnToIdle();
   }
 
-  /** 停止并释放当前动画混合器 */
-  function disposeMixer(): void {
-    clearOneshotListener();
-    if (mixer) {
-      mixer.stopAllAction();
-      mixer = null;
-    }
-    currentAction = null;
-    currentActionName = null;
-  }
-
-  /** 设置情绪表情（带平滑过渡） */
-  function setEmotion(name: string): void {
-    emotion.setEmotion(name);
+  /** 触发情绪表情（24 词表 + 强度 0~1，词表外由 faceDriver 回退 neutral） */
+  function setEmotion(name: string, intensity?: number): void {
+    face.setEmotion(name, intensity);
   }
 
   /** 设置五元音口型权重（0~1），由 wLipSync 驱动 */
   function setLipWeights(weights: Partial<LipSyncWeights>): void {
-    const manager = currentVrm?.expressionManager;
-    if (!manager) return;
     (Object.keys(lipWeights) as VowelPreset[]).forEach((key) => {
       const v = weights[key];
-      if (v === undefined) return;
-      const clamped = Math.max(0, Math.min(1, v));
-      lipWeights[key] = clamped;
-      manager.setValue(key, clamped);
+      if (v !== undefined) lipWeights[key] = Math.max(0, Math.min(1, v));
     });
+    face.setLipWeights(weights);
   }
 
   /** 复位所有口型权重为 0 */
   function resetLipWeights(): void {
-    const manager = currentVrm?.expressionManager;
     (Object.keys(lipWeights) as VowelPreset[]).forEach((key) => {
       lipWeights[key] = 0;
-      manager?.setValue(key, 0);
     });
+    face.resetLipWeights();
   }
 
   function getLipWeights(): LipSyncWeights {
@@ -655,17 +576,16 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   }
 
   function disposeCurrentVrm(): void {
-    // 先停止动画混合器，避免释放模型骨骼后 mixer 仍引用失效对象
-    disposeMixer();
+    // 先解绑动画层，避免释放模型骨骼后 mixer 仍引用失效对象
+    animator.unbind();
     if (currentVrmRoot) {
       scene.remove(currentVrmRoot);
       VRMUtils.deepDispose(currentVrmRoot);
       currentVrmRoot = null;
     }
     currentVrm = null;
-    // 重置情绪、眨眼、呼吸、说话摆动状态
-    emotion.reset();
-    blink.reset();
+    // 重置表情驱动、呼吸、说话摆动状态
+    face.reset();
     breath.reset();
     bodySway.reset();
     if (state.value.loaded) {
@@ -680,6 +600,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     resizeObserver?.disconnect();
     resizeObserver = null;
     disposeCurrentVrm();
+    animator.dispose();
     // 清理光源辅助球体
     lightHelpers.forEach((m) => {
       scene.remove(m);
@@ -707,6 +628,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
 
   return {
     state,
+    emotionState,
     ambientIntensity,
     keyLightIntensity,
     rimLightIntensity,
@@ -715,16 +637,19 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     bodySwayBodyAmplitude,
     bodySwayHeadAmplitude,
     init,
-    loadVrmFromBase64,
-    loadBackgroundFromBase64,
-    loadAnimationsFromBase64,
+    loadVrm,
+    loadBackground,
+    loadAnimations,
     playAction,
+    waitActionDone,
+    setIdle,
     returnToIdle,
     setEmotion,
     setLipWeights,
     resetLipWeights,
     getLipWeights,
     setAudioLevel,
+    animator,
   };
 }
 

@@ -8,11 +8,15 @@ import { useWebSocket } from '@/composables/useWebSocket';
 import { useVRMScene } from '@/composables/useVRMScene';
 import { usePerformance } from '@/composables/usePerformance';
 import { usePersistentRef } from '@/composables/usePersistentRef';
+import { fetchBinaryWithCache, clearFileCache } from '@/composables/fileCache';
+import { formatToMime } from '@/lib/utils';
 import {
   isPerformance,
+  isSetIdle,
   isUpdateAnimations,
   isUpdateBackground,
   isUpdateCharacter,
+  type FilePayload,
   type ServerMessage,
 } from '@/types/messages';
 
@@ -44,25 +48,59 @@ const performance = usePerformance({
 const ws = useWebSocket({
   onMessage: (msg: ServerMessage) => {
     if (isUpdateCharacter(msg)) {
-      scene.loadVrmFromBase64(msg.vrm.data, msg.vrm.filename).catch((e) => {
-        console.error('[VRM] 模型加载失败:', e);
-      });
+      // 大文件走 HTTP 文件下载服务（浏览器原生缓存，刷新页面不重推 WS）
+      resolveFileBuffer(msg.vrm)
+        .then((buffer) => scene.loadVrm(buffer, msg.vrm.filename))
+        .catch((e) => {
+          console.error('[VRM] 模型加载失败:', e);
+        });
     } else if (isUpdateBackground(msg)) {
-      scene.loadBackgroundFromBase64(
-        msg.background.data,
-        // 文件名后缀作为格式
-        msg.background.filename.split('.').pop() || 'png',
-        msg.background.filename,
-      );
+      // 背景直接把 URL 交给 TextureLoader（走浏览器 HTTP 缓存）
+      try {
+        scene.loadBackground(payloadToUrl(msg.background), msg.background.filename);
+      } catch (e) {
+        console.error('[背景] 加载失败:', e);
+      }
     } else if (isUpdateAnimations(msg)) {
-      scene.loadAnimationsFromBase64(msg.animations).catch((e) => {
-        console.error('[VRMA] 动画加载失败:', e);
-      });
+      Promise.all(
+        msg.animations.map(async (entry) => ({
+          name: entry.name,
+          layer: entry.layer,
+          buffer: await resolveFileBuffer(entry.file),
+        })),
+      )
+        .then((items) => scene.loadAnimations(items))
+        .catch((e) => {
+          console.error('[VRMA] 动画加载失败:', e);
+        });
+    } else if (isSetIdle(msg)) {
+      // 带外待机切换：即时生效（Base 层交叉淡化），不进表演层队列
+      scene.setIdle(msg.name);
     } else if (isPerformance(msg)) {
       performance.enqueue(msg);
     }
   },
 });
+
+/** FilePayload → 可加载 URL：url（文件下载服务相对路径）或 base64 data URL（兜底） */
+function payloadToUrl(payload: FilePayload): string {
+  if (payload.url) return ws.resolveFileUrl(payload.url);
+  if (payload.data) {
+    const ext = payload.filename.split('.').pop() || '';
+    return `data:${formatToMime(ext)};base64,${payload.data}`;
+  }
+  throw new Error(`文件负载缺少 url/data: ${payload.filename}`);
+}
+
+/** FilePayload → ArrayBuffer：url 经 Cache Storage 缓存 + 条件请求（304 免重传），data 兜底 */
+async function resolveFileBuffer(payload: FilePayload): Promise<ArrayBuffer> {
+  if (payload.url) return fetchBinaryWithCache(ws.resolveFileUrl(payload.url));
+  if (payload.data) {
+    const resp = await fetch(`data:application/octet-stream;base64,${payload.data}`);
+    return resp.arrayBuffer();
+  }
+  throw new Error(`文件负载缺少 url/data: ${payload.filename}`);
+}
 
 // 音量变化同步到表演层（持久化由 usePersistentRef 自动处理）
 watch(effectiveVolume, (v) => {
@@ -96,6 +134,15 @@ function onConnect(): void {
 function onDisconnect(): void {
   ws.disconnect();
 }
+
+/** 清空文件缓存（后端文件更新后使用），随后用干净状态重连拉取 */
+function onClearCache(): void {
+  clearFileCache()
+    .then(() => ws.connect())
+    .catch((e) => {
+      console.error('[FileCache] 清除失败:', e);
+    });
+}
 </script>
 
 <template>
@@ -111,12 +158,14 @@ function onDisconnect(): void {
     <SubtitleBar
       :text="performance.subtitle.value"
       :visible="performance.isPlaying.value"
-      :expression="performance.currentExpression.value"
+      :expression="performance.currentEmotion.value"
     />
 
     <ControlPanel
       v-model:open="panelOpen"
-      :url="ws.url.value"
+      :host="ws.host.value"
+      :ws-port="ws.wsPort.value"
+      :file-port="ws.filePort.value"
       v-model:volume="volume"
       v-model:muted="muted"
       v-model:ambient-intensity="scene.ambientIntensity.value"
@@ -129,10 +178,13 @@ function onDisconnect(): void {
       :status="ws.status.value"
       :scene-state="scene.state.value"
       :is-playing="performance.isPlaying.value"
-      :active-expression="performance.currentExpression.value"
-      @update:url="(v: string) => ws.setUrl(v)"
+      :emotion-state="scene.emotionState.value"
+      @update:host="ws.setHost"
+      @update:ws-port="ws.setWsPort"
+      @update:file-port="ws.setFilePort"
       @connect="onConnect"
       @disconnect="onDisconnect"
+      @clear-cache="onClearCache"
       @skip="performance.skip"
     />
   </main>

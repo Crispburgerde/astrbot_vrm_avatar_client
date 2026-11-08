@@ -14,12 +14,14 @@
  *
  * 生动摆动设计（音量驱动 + 惯性衰减 + 多频正弦合成）：
  * - 入参 audioLevel（0~1）：由表演层每帧从 wLipSync 归一化音量传入。
- * - intensity：对 audioLevel 做低通滤波（平滑跟随），实现"说话即动、停语渐止"的惯性，
- *   避免音量抖动造成的机械抽搐。
- * - 多频正弦合成：每个轴向叠加 2 条不同频率/相位的正弦波（主频 + 谐波），主项权重 0.7、
- *   谐波权重 0.3，合成结果范围 ≈ [-1, 1]，避免单一频率的机械节拍感。
+ * - intensity：对 audioLevel 做"非对称包络跟随"（起音快、释放慢，均按 dt 归一化），
+ *   实现"说话即动、停语渐止"的惯性；较长的释放时间常数同时滤除音节级（2~8Hz）
+ *   的音量抖动，避免摆动幅度随每个字泵动造成的碎感。
+ * - 多频正弦合成：每个轴向叠加 2 条不同频率/相位的正弦波（主频 + 谐波）。
+ *   身体主项权重 0.7、谐波 0.3；头部刻意降频（主频 0.28~0.45 Hz）并减弱谐波
+ *   （主项 0.85、谐波 0.15），高频小幅正弦叠加在视觉上是"碎抖"的主要来源。
  * - 身体 spine：缓慢左右偏航（Y）+ 轻微俯仰（X），幅度由 bodyAmplitude × intensity 驱动。
- * - 头部 head：相对身体更活泼的点头（X）+ 摇头（Y）+ 侧倾（Z，幅度减半避免夸张）。
+ * - 头部 head：舒缓的点头（X）+ 摇头（Y）+ 侧倾（Z，幅度减半避免夸张）。
  *
  * 与呼吸的叠加：useBreath 在 chest / head 上各插入了一个偏移节点；本层配置时，
  * spine 的父级仍是原始父级（无冲突），head 的父级已是 Head_Breath_Offset，本层在其下再插入
@@ -51,11 +53,18 @@ export interface BodySwayOptions {
    */
   headAmplitude?: number;
   /**
-   * 音量平滑系数（0~1），默认 0.15。
-   * intensity 每帧向 audioLevel 逼近的比例：值越大跟随越快、越小越平滑（惯性越强）。
-   * 0.15 在 60fps 下时间常数 ≈ 0.1s，兼顾响应感与自然惯性。
+   * 起音时间常数（秒），默认 0.15。
+   * audioLevel 高于当前强度时（开始说话），intensity 以该时间常数快速上冲，
+   * 保证"开口即动"的响应感。
    */
-  smoothing?: number;
+  attackTime?: number;
+  /**
+   * 释放时间常数（秒），默认 0.6。
+   * audioLevel 低于当前强度时（停语或音量回落），intensity 以该时间常数缓慢回落，
+   * 形成惯性余韵；较长的时间常数同时滤除音节级（2~8Hz）音量抖动，
+   * 避免摆动幅度随每个字泵动。两个时间常数均按 dt 归一化，与帧率无关。
+   */
+  releaseTime?: number;
 }
 
 export interface BodySwayController {
@@ -86,11 +95,12 @@ const HEAD_NODE_NAME = 'Head_BodySway_Offset';
 const BODY_YAW_W1 = 0.6 * Math.PI * 2; // 0.6 Hz 主频
 const BODY_YAW_W2 = 1.1 * Math.PI * 2; // 1.1 Hz 谐波（打破单一节拍）
 const BODY_PITCH_W = 0.45 * Math.PI * 2; // 0.45 Hz 俯仰（更慢的起伏）
-// 头部：更活泼，周期 0.8~1.5s，接近说话节律
-const HEAD_NOD_W1 = 1.2 * Math.PI * 2; // 1.2 Hz 点头主频
-const HEAD_NOD_W2 = 2.3 * Math.PI * 2; // 谐波
-const HEAD_TURN_W = 0.9 * Math.PI * 2; // 0.9 Hz 摇头
-const HEAD_TILT_W = 0.7 * Math.PI * 2; // 0.7 Hz 侧倾（最慢）
+// 头部：舒缓、克制（周期 2.2~3.6s）。高频小幅正弦叠加在视觉上呈现为"碎抖"，
+// 故刻意把主频降到 0.45Hz 以下，并减弱谐波权重。
+const HEAD_NOD_W1 = 0.45 * Math.PI * 2; // 0.45 Hz 点头主频（周期 ≈ 2.2s）
+const HEAD_NOD_W2 = 0.9 * Math.PI * 2; // 谐波
+const HEAD_TURN_W = 0.35 * Math.PI * 2; // 0.35 Hz 摇头
+const HEAD_TILT_W = 0.28 * Math.PI * 2; // 0.28 Hz 侧倾（最慢）
 
 /**
  * 在 child 的父级与 child 之间插入一个 identity 偏移节点。
@@ -117,7 +127,8 @@ export function useBodySway(initial?: BodySwayOptions): BodySwayController {
 
   let bodyAmp = initial?.bodyAmplitude ?? 0.03;
   let headAmp = initial?.headAmplitude ?? 0.05;
-  let smoothing = initial?.smoothing ?? 0.15;
+  let attackTime = initial?.attackTime ?? 0.15;
+  let releaseTime = initial?.releaseTime ?? 0.6;
 
   // 当前音量（0~1，由 setAudioLevel 写入）
   let audioLevel = 0;
@@ -130,7 +141,8 @@ export function useBodySway(initial?: BodySwayOptions): BodySwayController {
   function applyOptions(opts: BodySwayOptions): void {
     if (opts.bodyAmplitude !== undefined) bodyAmp = opts.bodyAmplitude;
     if (opts.headAmplitude !== undefined) headAmp = opts.headAmplitude;
-    if (opts.smoothing !== undefined) smoothing = opts.smoothing;
+    if (opts.attackTime !== undefined) attackTime = opts.attackTime;
+    if (opts.releaseTime !== undefined) releaseTime = opts.releaseTime;
   }
 
   function configure(
@@ -181,10 +193,15 @@ export function useBodySway(initial?: BodySwayOptions): BodySwayController {
   function update(dt: number): void {
     if (!bodyOffset && !headOffset) return;
 
-    // 低通滤波：intensity 平滑跟随 audioLevel，实现"说话即动、停语渐止"的惯性。
-    // smoothing 越大跟随越快（攻击陡），越小越平滑（释放慢）。
-    const k = smoothing < 0 ? 0 : smoothing > 1 ? 1 : smoothing;
-    intensity += (audioLevel - intensity) * k;
+    // 非对称包络跟随（dt 归一化，帧率无关）：起音快、释放慢。
+    // - audioLevel 高于 intensity（开始说话）时以 attackTime 快速上冲，"开口即动"；
+    // - 低于时以 releaseTime 缓慢回落，既形成停语余韵，又滤除音节级（2~8Hz）
+    //   音量抖动，避免摆动幅度随每个字泵动造成碎感。
+    const tau =
+      audioLevel > intensity
+        ? Math.max(attackTime, 1e-4)
+        : Math.max(releaseTime, 1e-4);
+    intensity += (audioLevel - intensity) * (1 - Math.exp(-dt / tau));
     if (intensity < 0.001) {
       intensity = 0;
       // 静止时直接清零偏移，避免残留微小旋转
@@ -217,20 +234,20 @@ export function useBodySway(initial?: BodySwayOptions): BodySwayController {
       bodyOffset.rotation.x = pitch * bodyAmp * 0.5 * intensity;
     }
 
-    // ---- 头部：更活泼的点头（X）/ 摇头（Y）/ 侧倾（Z） ----
+    // ---- 头部：舒缓的点头（X）/ 摇头（Y）/ 侧倾（Z），主项 0.85 + 弱谐波 0.15 ----
     if (headOffset) {
-      // X 点头：主频 1.2Hz（接近说话节律）+ 谐波
+      // X 点头：主频 0.45Hz（周期 ≈ 2.2s）+ 弱谐波
       const nod =
-        Math.sin(t * HEAD_NOD_W1) * 0.7 +
-        Math.sin(t * HEAD_NOD_W2 + 1.0) * 0.3;
+        Math.sin(t * HEAD_NOD_W1) * 0.85 +
+        Math.sin(t * HEAD_NOD_W2 + 1.0) * 0.15;
       // Y 摇头：略慢于点头，相位错开
       const turn =
-        Math.sin(t * HEAD_TURN_W + 0.8) * 0.7 +
-        Math.sin(t * HEAD_NOD_W2 * 0.9 + 0.4) * 0.3;
+        Math.sin(t * HEAD_TURN_W + 0.8) * 0.85 +
+        Math.sin(t * HEAD_NOD_W2 * 0.9 + 0.4) * 0.15;
       // Z 侧倾：最慢，赋予慵懒感
       const tilt =
-        Math.sin(t * HEAD_TILT_W + 0.5) * 0.7 +
-        Math.sin(t * HEAD_NOD_W1 * 1.4) * 0.3;
+        Math.sin(t * HEAD_TILT_W + 0.5) * 0.85 +
+        Math.sin(t * HEAD_NOD_W1 * 1.4) * 0.15;
       headOffset.rotation.x = nod * headAmp * intensity;
       headOffset.rotation.y = turn * headAmp * intensity;
       // 侧倾幅度减半，避免夸张的歪头

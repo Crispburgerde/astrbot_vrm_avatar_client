@@ -1,19 +1,26 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, watch } from 'vue';
 import { Settings, Power, Volume2, VolumeX, SkipForward } from 'lucide-vue-next';
 import type { ConnectionStatus } from '@/composables/useWebSocket';
 import type { VRMSceneState } from '@/composables/useVRMScene';
+import type { FaceEmotionState } from '@/emotion/faceDriver';
+
+// 多根节点（FAB + Transition 抽屉）组件：关闭透传属性自动继承，
+// 避免编辑器插件注入的 attrs（如 trae-inspector-*）触发刷屏警告
+defineOptions({ inheritAttrs: false });
 
 const props = defineProps<{
   open: boolean;
   status: ConnectionStatus;
-  url: string;
+  host: string;
+  wsPort: string;
+  filePort: string;
   volume: number;
   muted: boolean;
   sceneState: VRMSceneState;
   isPlaying: boolean;
-  /** 当前激活的表情名（用于高亮） */
-  activeExpression: string;
+  /** 情绪引擎实时状态（主导情绪 + VAD 数值），未绑定模型时为 null */
+  emotionState: FaceEmotionState | null;
   /** 三盏灯的强度 */
   ambientIntensity: number;
   keyLightIntensity: number;
@@ -28,12 +35,15 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   'update:open': [value: boolean];
-  'update:url': [value: string];
+  'update:host': [value: string];
+  'update:wsPort': [value: string];
+  'update:filePort': [value: string];
   'update:volume': [value: number];
   'update:muted': [value: boolean];
   connect: [];
   disconnect: [];
   skip: [];
+  clearCache: [];
   'update:ambientIntensity': [value: number];
   'update:keyLightIntensity': [value: number];
   'update:rimLightIntensity': [value: number];
@@ -43,14 +53,27 @@ const emit = defineEmits<{
   'update:bodySwayHeadAmplitude': [value: number];
 }>();
 
-const localUrl = ref(props.url);
+const localHost = ref(props.host);
+const localWsPort = ref(props.wsPort);
+const localFilePort = ref(props.filePort);
+// 外部值变化（如迁移重写）时同步到本地编辑副本
+watch(
+  () => [props.host, props.wsPort, props.filePort] as const,
+  ([h, p, f]) => {
+    if (h !== localHost.value) localHost.value = h;
+    if (p !== localWsPort.value) localWsPort.value = p;
+    if (f !== localFilePort.value) localFilePort.value = f;
+  },
+);
 
 function togglePanel(): void {
   emit('update:open', !props.open);
 }
 
 function onConnect(): void {
-  emit('update:url', localUrl.value.trim());
+  emit('update:host', localHost.value.trim());
+  emit('update:wsPort', localWsPort.value.trim());
+  emit('update:filePort', localFilePort.value.trim());
   emit('connect');
 }
 
@@ -70,6 +93,10 @@ function toggleMute(): void {
 
 function onSkip(): void {
   emit('skip');
+}
+
+function onClearCache(): void {
+  emit('clearCache');
 }
 
 function onAmbient(e: Event): void {
@@ -119,6 +146,19 @@ function onBodySwayHead(e: Event): void {
 function close(): void {
   emit('update:open', false);
 }
+
+/** VAD 双极条：value ∈ [-1,1]，中点为 0 */
+function vadBarStyle(value: number): Record<string, string> {
+  const half = Math.min(1, Math.abs(value)) * 50;
+  return value >= 0
+    ? { left: '50%', width: `${half}%` }
+    : { right: '50%', width: `${half}%` };
+}
+const VAD_ROWS = [
+  { key: 'valence', label: 'V 愉悦' },
+  { key: 'arousal', label: 'A 唤醒' },
+  { key: 'dominance', label: 'D 支配' },
+] as const;
 </script>
 
 <template>
@@ -142,16 +182,41 @@ function close(): void {
       <section class="block">
         <h3 class="block__title">连接</h3>
         <label class="field">
-          <span class="field__label">WebSocket 地址</span>
+          <span class="field__label">服务器主机</span>
           <input
-            v-model="localUrl"
+            v-model="localHost"
             class="field__input"
             type="text"
-            placeholder="ws://localhost:8765"
+            placeholder="localhost"
             spellcheck="false"
             :disabled="status === 'connected' || status === 'connecting'"
           />
         </label>
+        <div class="ports">
+          <label class="field ports__item">
+            <span class="field__label">WebSocket 端口</span>
+            <input
+              v-model="localWsPort"
+              class="field__input"
+              type="text"
+              inputmode="numeric"
+              placeholder="8765"
+              spellcheck="false"
+              :disabled="status === 'connected' || status === 'connecting'"
+            />
+          </label>
+          <label class="field ports__item">
+            <span class="field__label">文件下载端口</span>
+            <input
+              v-model="localFilePort"
+              class="field__input"
+              type="text"
+              inputmode="numeric"
+              placeholder="8766"
+              spellcheck="false"
+            />
+          </label>
+        </div>
         <div class="actions">
           <button
             v-if="status === 'disconnected'"
@@ -162,6 +227,9 @@ function close(): void {
           </button>
           <button v-else class="btn btn--ghost" @click="onDisconnect">
             <Power :size="16" :stroke-width="2" /> 断开
+          </button>
+          <button class="btn btn--ghost" title="后端文件更新后使用" @click="onClearCache">
+            清除资源缓存
           </button>
         </div>
       </section>
@@ -329,17 +397,30 @@ function close(): void {
             <dd>{{ sceneState.hasBackground ? sceneState.backgroundFilename : '—' }}</dd>
           </div>
         </dl>
-        <div class="exprs">
-          <span
-            v-for="e in sceneState.expressions"
-            :key="e"
-            class="exprs__chip"
-            :class="{ 'exprs__chip--active': e === activeExpression }"
-          >{{ e }}</span>
-          <span v-if="sceneState.expressions.length === 0" class="exprs__empty">
-            加载模型后显示表情
-          </span>
-        </div>
+        <!-- 情绪引擎状态：主导情绪 + VAD 实时数值（-1~1 双极条） -->
+        <template v-if="emotionState">
+          <div class="vad">
+            <span class="vad__dominant">{{ emotionState.dominant }}</span>
+            <div
+              v-for="row in VAD_ROWS"
+              :key="row.key"
+              class="vad__row"
+            >
+              <span class="vad__label">{{ row.label }}</span>
+              <div class="vad__track">
+                <div
+                  class="vad__fill"
+                  :class="emotionState.current[row.key] >= 0 ? 'vad__fill--pos' : 'vad__fill--neg'"
+                  :style="vadBarStyle(emotionState.current[row.key])"
+                />
+              </div>
+              <span class="vad__value">
+                {{ emotionState.current[row.key] >= 0 ? '+' : '' }}{{ emotionState.current[row.key].toFixed(2) }}
+              </span>
+            </div>
+          </div>
+        </template>
+        <p v-else class="exprs__empty">加载模型后显示情绪状态</p>
       </section>
     </aside>
   </Transition>
@@ -493,6 +574,9 @@ function close(): void {
 }
 
 .actions { display: flex; gap: 10px; }
+
+.ports { display: flex; gap: 10px; }
+.ports .field { flex: 1; min-width: 0; }
 
 .btn {
   display: inline-flex;
@@ -655,31 +739,66 @@ function close(): void {
   font-size: 12px;
 }
 
-.exprs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
+/* 情绪 VAD 展示 */
+.vad {
   margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
-.exprs__chip {
+.vad__dominant {
+  align-self: flex-start;
   font-size: 11px;
   letter-spacing: 0.04em;
-  color: var(--text-soft);
+  font-weight: 600;
+  color: #1a1208;
   padding: 4px 11px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--hairline);
-  transition: color 0.2s ease, border-color 0.2s ease,
-    background 0.2s ease, box-shadow 0.2s ease;
-}
-.exprs__chip--active {
-  color: #1a1208;
-  font-weight: 600;
   background: var(--accent-amber);
-  border-color: transparent;
-  box-shadow: 0 0 14px rgba(232, 184, 109, 0.5);
+}
+.vad__row {
+  display: grid;
+  grid-template-columns: 52px 1fr 44px;
+  align-items: center;
+  gap: 10px;
+}
+.vad__label {
+  font-size: 12px;
+  color: var(--text-soft);
+}
+.vad__track {
+  position: relative;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.vad__track::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.25);
+}
+.vad__fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  transition: width 0.12s linear;
+}
+.vad__fill--pos { background: var(--accent-amber); }
+.vad__fill--neg { background: #7a9bff; }
+.vad__value {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: right;
+  color: var(--text-soft);
 }
 .exprs__empty {
+  margin-top: 14px;
   font-size: 11px;
   color: var(--text-soft);
   opacity: 0.6;

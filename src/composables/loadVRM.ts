@@ -8,15 +8,11 @@ export interface LoadedVRM {
 }
 
 /**
- * 加载 base64 编码的 VRM：解析 GLTF → 提取 VRM → 去除冗余顶点/关节 →
+ * 加载 VRM（GLB 字节）：解析 GLTF → 提取 VRM → 去除冗余顶点/关节 →
  * VRM 0.x 朝向修正。纯异步变换，无场景状态依赖，可独立测试。
+ * 字节来源不限：HTTP 下载（文件下载服务）或 base64 解码均可。
  */
-export async function loadVRMFromBase64(b64: string): Promise<LoadedVRM> {
-  // 用浏览器原生 fetch 异步解码 base64，避免 atob + 逐字节 for 循环
-  // 阻塞主线程（60MB 文件经 atob+循环会卡死主线程数十秒）
-  const resp = await fetch(`data:application/octet-stream;base64,${b64}`);
-  const buffer = await resp.arrayBuffer();
-
+export async function loadVRM(buffer: ArrayBuffer): Promise<LoadedVRM> {
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
 

@@ -5,9 +5,8 @@ import {
   type WLipSyncAudioNode,
 } from 'wlipsync';
 import type {
-  PerformanceEvent,
+  Performance,
   PerformanceMessage,
-  TextChunkEvent,
 } from '@/types/messages';
 import type { LipSyncWeights, VowelPreset } from '@/types/lipsync';
 
@@ -20,18 +19,15 @@ const AUDIO_WORKLET_URL = '/audio-processor.js';
 const LIPSYNC_PROFILE_URL = '/profile.bin';
 
 export interface PerformanceSceneApi {
-  /** 设置情绪表情 */
-  setEmotion: (emotion: string) => void;
+  /** 触发情绪表情（24 词表 + 强度 0~1） */
+  setEmotion: (emotion: string, intensity?: number) => void;
   /** 设置五元音口型权重（0~1），由 wLipSync 驱动 */
   setLipWeights: (weights: Partial<LipSyncWeights>) => void;
   /** 复位所有口型权重为 0 */
   resetLipWeights: () => void;
   /** 设置当前说话音量（0~1），驱动身体/头部摆动幅度 */
   setAudioLevel: (level: number) => void;
-  /** 按名播放一个一次性动作动画（对应 update_animations 推送的动画 name）。
-   *  动作在待机动作之上播放一次后自动回归待机 */
-  playAction: (name: string) => void;
-  /** 淡出到待机（idle）动作：让进行中的一次性动作停下来回归待机 */
+  /** 释放覆盖层回归待机：让进行中的 Action/Gesture 动画停下来 */
   returnToIdle: () => void;
 }
 
@@ -43,21 +39,19 @@ export interface UsePerformanceOptions {
 }
 
 /**
- * 表演层：按事件顺序消费 performance 事件流——
- * 遇到 ExpressionTag 立即切换表情（sticky）、遇到 ActionTag 立即触发动作、
- * 遇到 TextChunk 才更新字幕并播放音频（驱动唇形同步）。
- * 事件之间无需先折叠成"段"，各自在到达时即时处理。
+ * 表演层：按顺序消费 performance 数组（每项 = 一句台词 + 情绪及其强度）——
+ * 每段先切换情绪（仅作用于本段台词，播完自动复位 neutral），再播放媒体
+ * （字幕 + 音频驱动唇形同步）。一次性动画触发（action 字段）已在 v1.5 移除。
  */
 export function usePerformance(options: UsePerformanceOptions) {
   const subtitle = ref('');
-  const currentExpression = ref('neutral');
+  const currentEmotion = ref('neutral');
   const isPlaying = ref(false);
 
-  const queue: PerformanceEvent[] = [];
+  const queue: Performance[] = [];
   let playing = false;
-  /** 最后一个处理的事件是 action 时为 true：队列耗尽后不主动 returnToIdle，
-   *  让场景层的 oneshotFinishListener 在动作自然结束后回归待机 */
-  let justPlayedAction = false;
+  /** skip/dispose 代数：等待中的段（媒体/延迟等待）据此检测自己已被跳过 */
+  let skipGeneration = 0;
   let audioCtx: AudioContext | null = null;
   let analyser: AnalyserNode | null = null;
   let gainNode: GainNode | null = null;
@@ -88,17 +82,16 @@ export function usePerformance(options: UsePerformanceOptions) {
     O: 'oh',
   };
 
-  /** 入队一段表演消息：直接把事件流压入队列，按事件顺序处理 */
+  /** 入队一段表演消息：把 performances 压入队列，按顺序处理 */
   function enqueue(message: PerformanceMessage): void {
-    const events = message.performance.events;
+    const performances = message.performances;
     console.log('[perf] enqueue 收到消息', {
-      eventCount: events.length,
+      count: performances.length,
       playing,
       queueLenBefore: queue.length,
-      kinds: events.map((e) => e.kind),
     });
-    for (const ev of events) {
-      queue.push(ev);
+    for (const item of performances) {
+      queue.push(item);
     }
     console.log('[perf] enqueue 入队后', {
       queueLenAfter: queue.length,
@@ -108,89 +101,73 @@ export function usePerformance(options: UsePerformanceOptions) {
   }
 
   async function playNext(): Promise<void> {
-    const ev = queue.shift();
-    if (!ev) {
+    const item = queue.shift();
+    if (!item) {
       console.log('[perf] playNext 队列为空，停止播放');
       playing = false;
       isPlaying.value = false;
       subtitle.value = '';
-      currentExpression.value = 'neutral';
+      currentEmotion.value = 'neutral';
       resetLip();
       options.scene.setEmotion('neutral');
-      // 队列结束：让进行中的一次性动作淡出回归待机。
-      // 但如果最后一个事件本身就是 action，不能立即 returnToIdle——
-      // 否则会把刚触发的动作掐掉。此时交由场景层的 oneshotFinishListener
-      // 在动作自然结束后自动回归待机。
-      if (!justPlayedAction) {
-        options.scene.returnToIdle();
-      }
-      justPlayedAction = false;
+      options.scene.returnToIdle();
       return;
     }
 
     playing = true;
     isPlaying.value = true;
+    // 段落开始时的 skip 代数：任何 await 之后若代数已变，说明本段被
+    // skip/dispose 打断，立即终止链路（skip 已完成全部清理）
+    const generation = skipGeneration;
 
-    // 按事件类型即时处理：表情/动作标签不需要等 TextChunk，
-    // 到达即生效；只有 TextChunk 才会播放媒体并阻塞到完成。
-    if (ev.kind === 'expression') {
-      justPlayedAction = false;
-      const prevExpression = currentExpression.value;
-      currentExpression.value = ev.name;
-      options.scene.setEmotion(ev.name);
-      console.log('[perf] expression 事件', {
-        name: ev.name,
-        prev: prevExpression,
-      });
-      // sticky 表情切换后缓冲一下，让表情过渡到位再处理后续事件
-      // （通常是紧随其后的 TextChunk 音频）
-      if (ev.name !== prevExpression) {
-        try {
-          await delay(EXPRESSION_AUDIO_DELAY);
-        } catch {
-          // skip 在延迟期间取消：结束本事件，不再处理后续
-          return;
-        }
+    // 情绪：仅在本段台词期间生效（词表外的值由 faceDriver 回退 neutral）
+    const prevEmotion = currentEmotion.value;
+    const emotion = item.emotion || 'neutral';
+    const intensity = item.intensity ?? 0.85;
+    currentEmotion.value = emotion;
+    options.scene.setEmotion(emotion, intensity);
+    console.log('[perf] 情绪', { name: emotion, intensity, prev: prevEmotion });
+
+    // 情绪切换后缓冲一下，让表情过渡到位再播放台词音频
+    if (emotion !== prevEmotion) {
+      try {
+        await delay(EXPRESSION_AUDIO_DELAY);
+      } catch {
+        // skip 在延迟期间取消：结束本段，不再处理后续
+        return;
       }
-      playNext();
-    } else if (ev.kind === 'action') {
-      justPlayedAction = true;
-      // 一次性动作：场景层播放一次后自动回归待机，
-      // 这里的 TextChunk 不干预动作状态——动作与说话并行播放。
-      options.scene.playAction(ev.name);
-      console.log('[perf] action 事件', { name: ev.name });
-      // 动作触发后立即继续，动画与后续 TextChunk 的音频并行
-      playNext();
-    } else {
-      justPlayedAction = false;
-      // TextChunk：只播放媒体（字幕 + 音频/静音）。
-      // 动作状态完全由 ActionTag 的 mode 语义管理，文本段不再触发 returnToIdle。
-      subtitle.value = ev.content;
-      console.log('[perf] text 事件', {
-        content: ev.content,
-        hasAudio: !!ev.audio,
-        audioFilename: ev.audio?.filename,
-        audioDataLen: ev.audio?.data?.length,
-      });
-      await playSegmentMedia(ev);
-      console.log('[perf] text 事件完成，进入下一事件', {
-        queueLenRemaining: queue.length,
-      });
-      playNext();
     }
+
+    // 台词：播放媒体（字幕 + 音频/静音），阻塞到完成
+    subtitle.value = item.text;
+    console.log('[perf] text 段', {
+      content: item.text,
+      hasAudio: !!item.audio,
+      audioFilename: item.audio?.filename,
+      audioDataLen: item.audio?.data?.length,
+    });
+    await playSegmentMedia(item);
+    if (generation !== skipGeneration) return; // skip 已接管清理，终止链路
+    // 本段结束：情绪作用域结束，复位 neutral
+    currentEmotion.value = 'neutral';
+    options.scene.setEmotion('neutral');
+    console.log('[perf] text 段完成，情绪复位 neutral，进入下一段', {
+      queueLenRemaining: queue.length,
+    });
+    playNext();
   }
 
-  /** 播放 TextChunk 的媒体部分（音频或静音）。 */
-  function playSegmentMedia(ev: TextChunkEvent): Promise<void> {
-    if (ev.audio) return playAudioSegment(ev);
-    return playSilentSegment(ev);
+  /** 播放段的媒体部分（音频或静音）。 */
+  function playSegmentMedia(item: Performance): Promise<void> {
+    if (item.audio) return playAudioSegment(item);
+    return playSilentSegment(item);
   }
 
-  function playAudioSegment(ev: TextChunkEvent): Promise<void> {
+  function playAudioSegment(item: Performance): Promise<void> {
     return new Promise(async (resolve) => {
       cleanupAudio();
 
-      const audio = ev.audio;
+      const audio = item.audio;
       if (!audio) {
         console.log('[perf] playAudioSegment 无 audio，直接 resolve');
         resolve();
@@ -303,12 +280,12 @@ export function usePerformance(options: UsePerformanceOptions) {
     });
   }
 
-  function playSilentSegment(ev: TextChunkEvent): Promise<void> {
+  function playSilentSegment(item: Performance): Promise<void> {
     return new Promise((resolve) => {
       // 无音频：按文本长度估算展示时长（约每字 180ms，至少 1.2s）
       const duration = Math.max(
         1200,
-        Math.min(8000, charCount(ev.content) * 180),
+        Math.min(8000, charCount(item.text) * 180),
       );
       silentTimer = window.setTimeout(() => {
         silentTimer = null;
@@ -486,6 +463,7 @@ export function usePerformance(options: UsePerformanceOptions) {
 
   /** 跳过当前表演（清空队列） */
   function skip(): void {
+    skipGeneration++;
     queue.length = 0;
     if (silentTimer !== null) {
       window.clearTimeout(silentTimer);
@@ -504,12 +482,12 @@ export function usePerformance(options: UsePerformanceOptions) {
     stopLipLoop();
     playing = false;
     isPlaying.value = false;
-    justPlayedAction = false;
     subtitle.value = '';
     resetLip();
     options.scene.setAudioLevel(0);
     options.scene.setEmotion('neutral');
-    // 跳过时让进行中的一次性动作淡出回归待机
+    // 跳过时让进行中的动作淡出回归待机。
+    // 待机变体是 set_idle 带外下发的持久状态，跳过表演不复位它
     options.scene.returnToIdle();
   }
 
@@ -540,7 +518,7 @@ export function usePerformance(options: UsePerformanceOptions) {
 
   return {
     subtitle,
-    currentExpression,
+    currentEmotion,
     isPlaying,
     enqueue,
     skip,

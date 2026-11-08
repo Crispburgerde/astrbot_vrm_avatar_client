@@ -52,7 +52,7 @@ npm run build
 npm run preview
 ```
 
-开发服务器启动后，浏览器打开页面即可。页面加载后会**自动连接**默认的 WebSocket 地址 `ws://localhost:8765`。
+开发服务器启动后，浏览器打开页面即可。页面加载后会**自动连接**默认后端 `ws://localhost:8765`。服务器主机、WebSocket 端口与文件下载端口均可在页面右上角控制台自行填写，并持久化保存在浏览器 localStorage 中。
 
 ### 连接 AstrBot 后端
 
@@ -103,12 +103,12 @@ npm run preview
 ```jsonc
 {
   "type": "performance",
-  "segments": [
+  "performances": [
     {
-      "dialogue": "你好呀！",
-      "expression": "happy",
-      "action": "wave",           // 可选，缺省时保持 idle
-      "audio": {                   // 可选，缺省时按文本长度静音展示
+      "text": "你好呀！",
+      "expression": "happy",       // 可选：说这句台词时佩戴，段末自动复位 neutral
+      "action": "wave",            // 可选：随台词触发的一次性动作（按动画 layer 路由）
+      "audio": {                   // 可选，由服务端 TTS 填充，缺省时按文本长度静音展示
         "filename": "tts_001.mp3",
         "data": "<base64>"
       }
