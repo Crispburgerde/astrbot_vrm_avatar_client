@@ -86,7 +86,8 @@ export interface PerformanceMessage {
  * - intensity 为情绪强度 0~1，服务端固定下发默认值 0.85
  * - text 恒非空（服务端跳过空台词段）
  * - start / end 为本段在共享音频内的时间窗（秒），由服务端词级对齐步骤回填；
- *   对齐失败或无音频时为 null，客户端回退按文本长度比例估算
+ *   对齐失败时服务端按文本长度比例估算回填，无音频时为 null
+ *   （客户端自己的比例估算仅作兜底防线，正常不触发）
  */
 export interface Performance {
   /** 台词 */
@@ -95,9 +96,9 @@ export interface Performance {
   emotion?: string;
   /** 情绪强度 0~1（服务端固定默认 0.85） */
   intensity?: number;
-  /** 本段在共享音频内的开始时间（秒），对齐失败时缺省 */
+  /** 本段在共享音频内的开始时间（秒），对齐失败时由服务端按比例估算回填 */
   start?: number | null;
-  /** 本段在共享音频内的结束时间（秒），对齐失败时缺省 */
+  /** 本段在共享音频内的结束时间（秒），对齐失败时由服务端按比例估算回填 */
   end?: number | null;
 }
 

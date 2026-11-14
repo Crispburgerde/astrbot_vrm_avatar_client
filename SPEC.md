@@ -157,6 +157,7 @@ v1.7 起 LLM 输出不再是无标记的 JSON 数组，而是**在原始回复�
 - **实现要点**：
   - 连接参数为「主机 + WebSocket 端口 + 文件下载端口」三字段，各自持久化到 localStorage（键 `vrm.avatar.host` / `vrm.avatar.wsPort` / `vrm.avatar.filePort`，默认 `localhost` / `8765` / `8766`）；WS 地址由 host+port 拼出；旧版单地址键 `vrm.avatar.wsUrl` 首次启动时迁移。`resolveFileUrl(path)` 把 FilePayload 的 `/files/...` 相对路径拼成 `http://{host}:{filePort}{path}`，供大文件 HTTP 下载；
   - 重连指数退避 `min(1000·2ⁿ, 8s)`，手动断开置 `manualClose` 不再重连；
+  - 作用域销毁（`onScopeDispose`）即 disconnect 并清重连定时器——组件卸载或 Vite HMR 重挂载不留"僵尸连接"。否则旧实例的连接会在后端重启后各自重连，服务端 broadcast 的 performance 被旧表演层再播一份（声音多重播放）；
   - 非 JSON 或无 `type` 的消息直接忽略；ws 实例用 `shallowRef` 避免被代理。
 
 ### 3.3 composables/usePerformance.ts — 表演层（核心调度）
@@ -167,7 +168,7 @@ v1.7 起 LLM 输出不再是无标记的 JSON 数组，而是**在原始回复�
   - **队列语义（v1.7）**：逐场处理。带音频的演出：**音频从头到尾只播一次**，单一 rAF 循环（口型 + 时间轴 + watchdog 合一）按 `el.currentTime` 推进——**情绪与字幕共用同一索引，在同一段边界同时切换**（FaceEngine 临界阻尼自带平滑过渡，不人为提前；首段在起播前就位），段间停顿保留上一段情绪/字幕，音频 `ended` 后复位 neutral。时间轴构建：全部段带有效 `start/end`（服务端词级对齐回填，重叠窗口钳到递增）才直接采用，否则等元数据拿到时长后按文本长度比例估算。无音频的演出回退逐段静音展示（每字 180ms，下限 1.2s 上限 8s，情绪变化时延迟 600ms 过渡）。队列耗尽时复位表情/口型并 `returnToIdle()`。`skip()` 递增代数（skipGeneration），等待中的演出在任何 await 之后检测到代数变化即终止链路。v1.5 起 performance 段不再携带 `action`，无动画等待；待机变体切换自 v1.4 起移出队列，`skip()` 亦不复位待机覆盖。
   - **音频链路**：`Audio(dataURL) → createMediaElementSource` 扇出到两支：`lipsyncNode`（分析支路，终端节点）+ `gainNode → destination`（播放支路，音量实际由 gain 控制）。AudioContext 必须解锁：首次 pointerdown/keydown 或点击连接时提前 resume 并预建图（wlipsync 内联 worklet 是 data: URL，Chrome 不支持，需先从 `/audio-processor.js` 加载注册 processor，再 fetch `/profile.bin` 解析 profile 创建节点）。
   - **口型驱动**（rAF 内）：wLipSync 输出音素权重 × 归一化音量，映射 A/I/U/E/O → aa/ih/ou/ee/oh 写入场景层（faceDriver 统一写入面部 morph）；音量同步喂给 bodySway。咝音 S 无对应口型，忽略。
-  - **健壮性**：watchdog 监测 `currentTime` 卡死 3s 强制结束演出；`el.src=''` 前先摘 onerror 避免伪 error；`ensureAudioGraph` 合并并发调用防 AbortError；等待元数据超时 3s 兜底。
+  - **健壮性**：watchdog 监测 `currentTime` 卡死 3s 强制结束演出；`el.src=''` 前先摘 onerror 避免伪 error；`ensureAudioGraph` 合并并发调用防 AbortError；等待元数据超时 3s 兜底。**dispose 后实例永久停播**：`disposed` 标记拦截 `enqueue`/`unlockAudio`，防止被旧 WS 连接的消息"复活"并重建 AudioContext；skip/dispose 经 abort 句柄唤醒挂起的 `playAudioShow` Promise（cleanupAudio 摘除事件后 ended/error 不再触发，无此句柄则 Promise 永不 resolve，链路泄漏）。
 
 ### 3.4 composables/useVRMScene.ts — 场景层
 

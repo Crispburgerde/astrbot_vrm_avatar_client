@@ -73,6 +73,10 @@ export function usePerformance(options: UsePerformanceOptions) {
   let playing = false;
   /** skip/dispose 代数：等待中的演出（媒体/延迟等待）据此检测自己已被跳过 */
   let skipGeneration = 0;
+  /** dispose 标记：销毁后的实例永久停播，防止被旧 WS 连接的消息"复活" */
+  let disposed = false;
+  /** 进行中带音频演出的强制收尾句柄：skip/dispose 时唤醒其挂起的 Promise */
+  let activeAbort: (() => void) | null = null;
   let audioCtx: AudioContext | null = null;
   let gainNode: GainNode | null = null;
   let currentAudioEl: HTMLAudioElement | null = null;
@@ -103,6 +107,9 @@ export function usePerformance(options: UsePerformanceOptions) {
 
   /** 入队一场演出：整条消息（表演段数组 + 共享音频）压入队列，按顺序处理 */
   function enqueue(message: PerformanceMessage): void {
+    // 已销毁实例拒收：dispose 已关闭 AudioContext，若放行会在这里重建
+    // 一条全新音频链路继续出声（旧 WS 僵尸连接复活 → 声音多重播放）
+    if (disposed) return;
     const show: Show = {
       performances: message.performances,
       audio: message.audio,
@@ -220,6 +227,7 @@ export function usePerformance(options: UsePerformanceOptions) {
       const finish = (reason: string): void => {
         if (settled) return;
         settled = true;
+        activeAbort = null;
         console.log(`[perf] 演出结束（${reason}）`);
         stopLoop();
         resetLip();
@@ -228,6 +236,10 @@ export function usePerformance(options: UsePerformanceOptions) {
         cleanupAudio();
         resolve();
       };
+
+      // 供 skip/dispose 强制收尾（finish 幂等）：cleanupAudio 摘除事件与
+      // src 后，ended/error 都不会再触发，Promise 若无此句柄将永不 resolve
+      activeAbort = () => finish('aborted');
 
       el.addEventListener('ended', () => finish('ended'), { once: true });
       // 使用 onerror 属性形式，便于 cleanupAudio 在置空 src 前移除，
@@ -535,6 +547,7 @@ export function usePerformance(options: UsePerformanceOptions) {
    * 队列因此永久卡死。
    */
   function unlockAudio(): void {
+    if (disposed) return;
     // 触发 profile 预加载与节点创建（异步，不阻塞手势）
     ensureAudioGraph().catch((e) => {
       console.warn('[perf] unlockAudio: ensureAudioGraph 失败', e);
@@ -621,6 +634,12 @@ export function usePerformance(options: UsePerformanceOptions) {
     }
     cleanupAudio();
     stopLoop();
+    // 唤醒被跳过的 playAudioShow（其 Promise 原本可能永不 resolve）
+    if (activeAbort) {
+      const abort = activeAbort;
+      activeAbort = null;
+      abort();
+    }
     playing = false;
     isPlaying.value = false;
     subtitle.value = '';
@@ -633,6 +652,8 @@ export function usePerformance(options: UsePerformanceOptions) {
   }
 
   function dispose(): void {
+    // 先置 disposed 再清理：此后 enqueue 永久拒收，实例不可再被复活
+    disposed = true;
     if (unlockOnce) {
       window.removeEventListener('pointerdown', unlockOnce);
       window.removeEventListener('keydown', unlockOnce);

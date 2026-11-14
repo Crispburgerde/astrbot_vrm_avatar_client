@@ -1,4 +1,4 @@
-import { computed, ref, shallowRef } from 'vue';
+import { computed, onScopeDispose, ref, shallowRef } from 'vue';
 import type { ServerMessage } from '@/types/messages';
 import { usePersistentRef } from '@/composables/usePersistentRef';
 
@@ -171,6 +171,12 @@ export function useWebSocket(options: UseWebSocketOptions) {
     const p = path.startsWith('/') ? path : `/${path}`;
     return `http://${host.value.trim()}:${filePort.value.trim()}${p}`;
   }
+
+  // 作用域销毁（组件卸载 / Vite HMR 重挂载）时断开连接并停止重连定时器。
+  // 否则旧实例的 WebSocket 会成为僵尸连接：它仍接收 broadcast 消息并驱动
+  // 已 dispose 的旧表演层，且后端重启后会各自重连 —— 服务端出现多条客户端
+  // 连接，一条 performance 广播被播放多份（声音多重播放）。
+  onScopeDispose(disconnect);
 
   return {
     status,
