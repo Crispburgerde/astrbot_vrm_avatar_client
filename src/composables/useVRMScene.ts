@@ -337,6 +337,14 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     // 同时为 hitomi 启用 depthWrite，从根本上消除与眼白的排序竞争。
     fixEyeRenderOrder(vrmRoot);
 
+    // 关闭蒙皮网格的视锥剔除：CPU 侧包围球按静止绑定姿势计算，蒙皮在 GPU 上
+    // 移动顶点后包围球不更新。VRMA 动画把骨骼移到偏离姿势（如坐下）后包围球
+    // 过期，镜头靠近时脸部网格会被整体误剔除（身体网格包围球大仍可见）。
+    // VRM 模型网格数少，关闭剔除对性能无影响。
+    vrmRoot.traverse((obj) => {
+      if (obj instanceof THREE.SkinnedMesh) obj.frustumCulled = false;
+    });
+
     // 提取模型内嵌表情名（过滤口型/眨眼/视线等功能性表情；仅作 UI 展示，
     // 情绪驱动已由 faceDriver 按 morph 绑定接管，不再依赖模型表情名）
     const exprMap = vrm.expressionManager?.expressionMap ?? {};
@@ -424,7 +432,8 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     const dist = halfExtent / Math.tan(vFov / 2);
     camera.position.set(center.x, center.y, center.z + dist);
     camera.lookAt(center.x, center.y, center.z);
-    camera.near = Math.max(0.05, dist * 0.1);
+    // 近平面取固定小值（5cm）：贴近脸部才裁剪，避免镜头稍微推进就穿模
+    camera.near = 0.05;
     camera.far = dist * 10;
     camera.updateProjectionMatrix();
 
