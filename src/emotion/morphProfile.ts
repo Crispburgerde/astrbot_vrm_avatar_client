@@ -39,6 +39,61 @@ export const vroidProfile: ModelProfile = { schema: 1, name: 'VRoid · Anime AU 
   b('au45Blink', '双眼眨眼', [{names: ['eyeBlinkLeft', ...vr('EYE_Close')], weight: 1}], 'direct'),
 ] };
 
+/** Anime / VRChat 系命名方言：VRChat viseme（vrc.v_*）、模型作者 romaji 自定义名
+ *  （mouth_a / eye_close / brow_joy …）与 MMD 日文名的三层候选。
+ *  适配 VRChat 社区模型转 VRM 的常见命名体系（如 Manuka）。
+ *  散形状多为局部微调、单形状表现力弱，故情绪 AU 采用多目标组带权并联：
+ *  主形状 + 风格化整脸代理（怒り / びっくり / なごみ 等 MMD 全脸形状），
+ *  与 vroidProfile 的 Fcl 整脸代理哲学一致。 */
+export const animeProfile: ModelProfile = { schema: 1, name: 'Anime/VRC · Romaji & MMD Profile', bindings: [
+  b('au01InnerBrowRaiser', '内眉上提·悲眉', [
+    {names: ['brow_sad'], weight: 1},
+    {names: ['困る', 'eye_sad'], weight: 0.7},
+  ]),
+  b('au02OuterBrowRaiser', '外眉上提·惊眉', [
+    {names: ['brow_up', 'brow_surprised'], weight: 1},
+    {names: ['びっくり'], weight: 0.7},
+  ]),
+  b('au04BrowLowerer', '眉毛下压·怒', [
+    {names: ['brow_anger'], weight: 1},
+    {names: ['brow_anger 2'], weight: 0.6},
+    {names: ['eye_angry'], weight: 0.8},
+    {names: ['怒り'], weight: 0.5},
+  ]),
+  b('au05UpperLidRaiser', '睁大眼', [
+    {names: ['eye_morph_wide'], weight: 1},
+    {names: ['びっくり'], weight: 0.8},
+  ]),
+  b('au06CheekRaiser', '笑眼', [
+    {names: ['eye_joy', '笑い'], weight: 1},
+    {names: ['eye_happy', 'brow_joy'], weight: 0.8},
+    {names: ['なごみ'], weight: 0.5},
+  ]),
+  b('au07LidTightener', '眯眼·怒目', [
+    {names: ['eye_jito', 'ｷﾘｯ'], weight: 1},
+    {names: ['eye_angry'], weight: 0.6},
+  ]),
+  b('au12LipCornerPuller', '嘴角上扬·笑', [
+    {names: ['mouth_smile', 'にやり'], weight: 1},
+    {names: ['mouth_grin_L'], weight: 0.6},
+    {names: ['口角上げ'], weight: 0.5},
+  ]),
+  b('au15LipCornerDepressor', '嘴角下垂·悲', [
+    {names: ['mouth_sad'], weight: 1},
+    {names: ['口角下げ'], weight: 0.7},
+    {names: ['eye_sad'], weight: 0.6},
+  ]),
+  b('au18LipPucker', '嘟嘴', [{names: ['mouth_ω'], weight: 0.8}]),
+  b('au20LipStretcher', '嘴唇横向拉伸', [{names: ['mouth_wide', '口横広げ'], weight: 0.65}]),
+  b('au25LipsPart', '嘴唇分开', [{names: ['mouth_a', 'あ'], weight: 0.45}]),
+  b('au26JawDrop', '下颌张开', [{names: ['mouth_a', 'あ'], weight: 0.9}]),
+  b('au27MouthStretch', '嘴巴大张', [{names: ['ワ'], weight: 0.8}]),
+  b('au45Blink', '双眼眨眼', [{names: ['eye_close', 'まばたき'], weight: 1}], 'direct'),
+] };
+
+/** 全部命名方言词典；faceDriver 按各词典 resolve 命中数最多者择优绑定 */
+export const bindingProfiles: ModelProfile[] = [vroidProfile, animeProfile];
+
 /** Fcl_ 区域名大小写归一化（部分 VRM 0.x 导出器大小写不稳定） */
 export function canonicalMorphName(name: string): string {
   const match = name.match(/Fcl_(.+)$/i);

@@ -24,7 +24,7 @@ import type { VRM } from '@pixiv/three-vrm';
 import type { LipSyncWeights, VowelPreset } from '@/types/lipsync';
 import { FaceEngine, actionUnitDefinitions, type FrameState, type FACSActionUnitState } from './engine';
 import { emotionByName } from './emotions';
-import { computeMorphWeights, resolveProfile, vroidProfile, MOUTH_AU_RE, type ResolvedBinding } from './morphProfile';
+import { computeMorphWeights, resolveProfile, bindingProfiles, MOUTH_AU_RE, type ResolvedBinding } from './morphProfile';
 import { type EyeAngles } from './directions';
 
 const clamp01 = (v: number) => Math.min(1, Math.max(0, Number.isFinite(v) ? v : 0));
@@ -34,13 +34,19 @@ const LIP_EMOTION_SUPPRESS = 0.7;
 /** 情绪嘴部权重下限（说话最开口时保留的比例） */
 const EMOTION_GATE_MIN = 0.3;
 
-/** 五元音 → 模型嘴部 morph 候选名（VRM 预设名 + VRoid Fcl 命名） */
+/** 调试开关的默认值：true 时屏蔽「表情 ↔ 口型」相互作用——嘴部情绪 AU 全部
+ *  清零（闸门与 morph 取 max 合并随之旁路），嘴部 morph 只由 wLipSync 五元音
+ *  驱动，用于隔离观察口型原始效果。默认 false（正常行为），UI 可实时切换 */
+const DEFAULT_LIP_ISOLATION = false;
+
+/** 五元音 → 模型嘴部 morph 候选名（按命中优先级排列：
+ *  VRM 预设名 → VRoid Fcl 命名 → VRChat viseme → romaji 自定义 → MMD 日文） */
 const VOWEL_MORPH_CANDIDATES: Record<VowelPreset, string[]> = {
-  aa: ['aa', 'Fcl_MTH_A', 'Face.M_F00_000_Fcl_MTH_A', 'jawOpen', 'mouthOpen'],
-  ih: ['ih', 'Fcl_MTH_I', 'Face.M_F00_000_Fcl_MTH_I'],
-  ou: ['ou', 'Fcl_MTH_U', 'Face.M_F00_000_Fcl_MTH_U', 'mouthPucker'],
-  ee: ['ee', 'Fcl_MTH_E', 'Face.M_F00_000_Fcl_MTH_E'],
-  oh: ['oh', 'Fcl_MTH_O', 'Face.M_F00_000_Fcl_MTH_O'],
+  aa: ['aa', 'Fcl_MTH_A', 'Face.M_F00_000_Fcl_MTH_A', 'vrc.v_aa', 'mouth_a', 'あ', 'jawOpen', 'mouthOpen'],
+  ih: ['ih', 'Fcl_MTH_I', 'Face.M_F00_000_Fcl_MTH_I', 'vrc.v_ih', 'mouth_i', 'い'],
+  ou: ['ou', 'Fcl_MTH_U', 'Face.M_F00_000_Fcl_MTH_U', 'vrc.v_ou', 'mouth_u', 'う', 'mouthPucker'],
+  ee: ['ee', 'Fcl_MTH_E', 'Face.M_F00_000_Fcl_MTH_E', 'vrc.v_e', 'mouth_e', 'え'],
+  oh: ['oh', 'Fcl_MTH_O', 'Face.M_F00_000_Fcl_MTH_O', 'vrc.v_oh', 'mouth_o', 'お'],
 };
 
 /** faceDriver 依赖的最小表情管理器接口 */
@@ -68,6 +74,8 @@ export interface FaceDriver {
   setLipWeights(weights: Partial<LipSyncWeights>): void;
   /** 复位口型权重（闸门回升） */
   resetLipWeights(): void;
+  /** 调试：口型隔离开关——true 时嘴部情绪 AU 清零，嘴部只由 wLipSync 驱动 */
+  setLipIsolation(enabled: boolean): void;
   /** 推进引擎（每帧调用；内部 120Hz 定步长） */
   update(dt: number): void;
   /** animator.update 之前调用：还原上一帧的头部姿态偏移 */
@@ -122,6 +130,9 @@ export function useFaceDriver(): FaceDriver {
 
   let frame: FrameState | null = null;
 
+  // ---- 口型隔离开关（UI 实时可切，见 setLipIsolation） ----
+  let lipIsolation = DEFAULT_LIP_ISOLATION;
+
   // 复用向量（避免每帧分配）
   const tmpVec = new THREE.Vector3();
   const tmpVec2 = new THREE.Vector3();
@@ -156,6 +167,10 @@ export function useFaceDriver(): FaceDriver {
       lipWeights[key] = 0;
     });
     mouthGateTarget = 1;
+  }
+
+  function setLipIsolation(enabled: boolean): void {
+    lipIsolation = enabled;
   }
 
   function update(dt: number): void {
@@ -222,6 +237,14 @@ export function useFaceDriver(): FaceDriver {
   /** 口型闸门作用后的 AU（嘴部 AU × gate，其余不变） */
   function gatedAus(): FACSActionUnitState {
     const aus = { ...frame!.aus } as FACSActionUnitState;
+    // 口型隔离：嘴部情绪 AU 直接清零——表情完全不写嘴部 morph（双向隔离，
+    // 闸门无需作用），直写与预设回退两条路径在此统一收口
+    if (lipIsolation) {
+      for (const definition of actionUnitDefinitions) {
+        if (MOUTH_AU_RE.test(definition.key)) aus[definition.key] = 0;
+      }
+      return aus;
+    }
     if (mouthGate >= 0.999) return aus;
     for (const definition of actionUnitDefinitions) {
       if (MOUTH_AU_RE.test(definition.key)) {
@@ -324,9 +347,21 @@ export function useFaceDriver(): FaceDriver {
       for (const name of Object.keys(dict)) morphNames.add(name);
     });
 
-    // 解析 AU 绑定；命中不足（<4）→ 预设表情回退
-    bindings = resolveProfile(vroidProfile, morphNames);
-    fallback = bindings.filter((b) => b.supported).length < 4;
+    // 解析 AU 绑定：多本命名方言词典竞标——各完整 resolve 一遍，取命中数
+    // （supported 绑定数）最多者；谁解释该模型更好就信谁，保证每个模型由
+    // 一套自洽的命名方言驱动。最好的一本命中仍 <4 → 预设表情回退
+    let boundProfileName = '';
+    let bestCount = -1;
+    for (const profile of bindingProfiles) {
+      const resolved = resolveProfile(profile, morphNames);
+      const count = resolved.filter((b) => b.supported).length;
+      if (count > bestCount) {
+        bestCount = count;
+        bindings = resolved;
+        boundProfileName = profile.name;
+      }
+    }
+    fallback = bestCount < 4;
 
     // 解析元音口型 morph
     vowelMorphs.clear();
@@ -341,8 +376,9 @@ export function useFaceDriver(): FaceDriver {
 
     // eslint-disable-next-line no-console
     console.log('[FaceDriver] 模型绑定完成', {
+      profile: boundProfileName,
       morphs: morphNames.size,
-      supportedBindings: bindings.filter((b) => b.supported).length,
+      supportedBindings: bestCount,
       fallback,
       vowels: [...vowelMorphs.keys()],
     });
@@ -383,6 +419,7 @@ export function useFaceDriver(): FaceDriver {
     setEmotion,
     setLipWeights,
     resetLipWeights,
+    setLipIsolation,
     update,
     prepareHead,
     applyHead,

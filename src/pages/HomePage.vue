@@ -33,6 +33,9 @@ const panelOpen = ref(false);
 const volume = usePersistentRef<number>(VOLUME_KEY, 0.8);
 const muted = usePersistentRef<boolean>(MUTED_KEY, false);
 
+// 口型隔离开关（调试用，不持久化——避免忘记关闭导致嘴部情绪长期缺失）
+const lipIsolation = ref(false);
+
 const effectiveVolume = computed(() => (muted.value ? 0 : volume.value));
 
 // VRM 场景层
@@ -107,6 +110,11 @@ watch(effectiveVolume, (v) => {
   performance.setVolume(v);
 });
 
+// 口型隔离开关实时同步到表情驱动层
+watch(lipIsolation, (v) => {
+  scene.setLipIsolation(v);
+});
+
 // 待机提示文案
 const hint = computed(() => {
   if (ws.status.value === 'disconnected') return '正在连接后端…';
@@ -175,6 +183,7 @@ function onClearCache(): void {
       v-model:shoulder-breath-amplitude="scene.shoulderBreathAmplitude.value"
       v-model:body-sway-body-amplitude="scene.bodySwayBodyAmplitude.value"
       v-model:body-sway-head-amplitude="scene.bodySwayHeadAmplitude.value"
+      v-model:lip-isolation="lipIsolation"
       :status="ws.status.value"
       :scene-state="scene.state.value"
       :is-playing="performance.isPlaying.value"

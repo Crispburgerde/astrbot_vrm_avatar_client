@@ -1,6 +1,6 @@
 # astrbot_vrm_avatar_client 技术规格（Spec）
 
-> 版本 1.6 · 更新于 2026-11-08 · 协议或核心机制变更时须同步更新本文档
+> 版本 1.7 · 更新于 2026-11-11 · 协议或核心机制变更时须同步更新本文档
 
 VRM 虚拟形象的浏览器端驱动客户端。通过 WebSocket 接收 AstrBot 后端推送的模型、动画与"表演"数组，在 Three.js 场景中实时渲染虚拟形象：说话（TTS 音频 + 口型同步）、情绪表情（借用 SoullinkEmotion3D 的表情控制引擎：24 词情绪词表 + VAD 状态机 + FACS AU 求解 + morph 直写）、动作与生命感动画。
 
@@ -66,7 +66,7 @@ OrbitControls 阻尼 → face.update(dt)（FaceEngine 120Hz 定步长：情绪 A
 | `update_background` | `background: FilePayload` | 背景图；`url` 引用 |
 | `update_animations` | `animations: AnimationEntry[]` | 命名 VRMA 动画集；`layer: idle/gesture/action(default)`，idle 层条目供 `set_idle` 工具白名单校验（v1.5 起 gesture/action 条目仅注册保留，performance 不再引用）；`url` 引用 |
 | `set_idle` | `name: string` | 切换 Base 层待机变体（v1.4 起独立消息，脱离 performance 数组） |
-| `performance` | `performances: Performance[]` | 一次 LLM 回复解析出的**有序表演段数组** |
+| `performance` | `performances: Performance[]`, `audio?: FilePayload` | 一次 LLM 回复解析出的**有序表演段数组** + **一条共享 TTS 音频**（数组的兄弟字段，v1.7 起不再逐段内嵌）；音频整条只播一次，客户端按每段 `start/end` 时间窗切换情绪与字幕 |
 
 `FilePayload = { filename, url? | data? }`——**恰好设置其一**（v1.6 起）：大文件（VRM/背景/VRMA）用 `url`（文件下载服务的相对路径 `/files/<name>`，客户端拼 `http://{host}:{filePort}` 后经 fetch/TextureLoader 下载，走浏览器原生 HTTP 缓存，页面刷新不重推 WS）；小负载（TTS 音频）仍内嵌 `data` base64。
 
@@ -106,25 +106,28 @@ OrbitControls 阻尼 → face.update(dt)（FaceEngine 120Hz 定步长：情绪 A
 {
   "type": "performance",
   "performances": [
-    { "text": "你好呀！", "emotion": "happy", "intensity": 0.9,
-      "audio": { "filename": "tts_01.mp3", "data": "<base64>" } },
-    { "text": "哼，我才不在意呢", "emotion": "frustrated", "intensity": 0.7 }
-  ]
+    { "text": "你好呀！", "emotion": "happy", "intensity": 0.85,
+      "start": 0.0, "end": 1.8 },
+    { "text": "哼，我才不在意呢", "emotion": "frustrated", "intensity": 0.85,
+      "start": 1.8, "end": 4.2 }
+  ],
+  "audio": { "filename": "tts_reply.mp3", "data": "<base64>" }
 }
 ```
 
-字段语义以 [src/types/messages.ts](src/types/messages.ts) 与 `server_reference/` 的 pydantic 模型为准；`AnimationEntry.layer` 缺省为 `"action"`，`audio` 由服务端 TTS 填充、可缺省。
+字段语义以 [src/types/messages.ts](src/types/messages.ts) 与 `server_reference/` 的 pydantic 模型为准；`AnimationEntry.layer` 缺省为 `"action"`，共享 `audio` 由服务端 TTS 步骤填充、可缺省。
 
-### 2.2 performance 数组（v1.5）
+### 2.2 performance 消息（v1.7）
 
-一次 LLM 回复 = 一个 JSON 数组，每个元素（`Performance`）= 一句台词 + 情绪及其强度：
+一次 LLM 回复 = 一个表演段数组 + 一条共享音频，每个元素（`Performance`）= 一段台词 + 情绪及其在共享音频内的时间窗：
 
 - `text: string` — 本段台词；恒非空（服务端跳过空台词段）
-- `emotion?: string` — 本段台词期间的情绪，属**固定 24 词情绪词表**（`neutral/happy/excited/amused/proud/confident/calm/relieved/affectionate/shy/embarrassed/curious/concerned/confused/tired/sad/lonely/disappointed/anxiety/fear/anger/frustrated/disgust/surprised`），与前端表情引擎 `src/emotion/emotions.ts` 的 `emotionCatalog` 逐词同步；词表外值在服务端降级为 `neutral`（客户端 faceDriver 二次兜底）。**段作用域**：本段播完自动复位 neutral
-- `intensity?: number` — 情绪强度 `0~1`，缺省/非法时服务端钳制为 `0.85`
-- `audio?: FilePayload` — 台词对应的 TTS 音频（Fish Audio 等 TTS 会把情绪以 `[emotion]` 前缀随文本送入以驱动情感韵律），可能缺省
+- `emotion?: string` — 本段台词期间的情绪，属**固定 24 词情绪词表**（`neutral/happy/excited/amused/proud/confident/calm/relieved/affectionate/shy/embarrassed/curious/concerned/confused/tired/sad/lonely/disappointed/anxiety/fear/anger/frustrated/disgust/surprised`），与前端表情引擎 `src/emotion/emotions.ts` 的 `emotionCatalog` 逐词同步；词表外值在服务端降级为 `neutral`（客户端 faceDriver 二次兜底）。**段作用域**：时间窗内生效，音频播完复位 neutral
+- `intensity?: number` — 情绪强度 `0~1`；LLM 不再生成，服务端固定下发默认 `0.85`
+- `start? / end?: number` — 本段在共享音频内的时间窗（秒），由服务端词级对齐（forced alignment）步骤回填；对齐失败或无音频时为 `null`，客户端回退按文本长度比例把段均分到音频时长
+- 消息级 `audio?: FilePayload` — **整次回复合成的单条 TTS 音频**（各段文本带 `[emotion]` 前缀拼接后一次合成，情绪前缀同时驱动 TTS 情感韵律），base64 内嵌于消息（数组的兄弟字段），可缺省
 
-v1.5 移除了 `expression`（模型表情名）与 `action`（一次性动画触发）字段：表情驱动改为与模型无关的固定情绪词表 + 强度；一次性动画不再随表演触发（Gesture/Action 层与 `layer` 注册保留，供未来使用）。LLM 的 JSON 数组输出由服务端解析（见 §3.12）：词表校验 + 强度钳制 + TTS 音频注入后，才下发 performance 消息。待机切换不在此数组中——由服务端 `set_idle` LLM 工具直接下发独立消息。
+v1.7 起 LLM 输出不再是无标记的 JSON 数组，而是**在原始回复文本中内联插入 `[emotion]` 标签**（每个标签作用于其后至下一标签的文本），服务端 `parse_tagged_text` 解析回表演段（见 §3.12）；非词表方括号 token 保留为字面文本。v1.5 移除了 `expression` 与 `action` 字段的决策不变；待机切换仍由服务端 `set_idle` LLM 工具直接下发独立消息。
 
 ### 2.3 set_idle 消息（v1.4）
 
@@ -154,17 +157,18 @@ v1.5 移除了 `expression`（模型表情名）与 `action`（一次性动画�
 - **实现要点**：
   - 连接参数为「主机 + WebSocket 端口 + 文件下载端口」三字段，各自持久化到 localStorage（键 `vrm.avatar.host` / `vrm.avatar.wsPort` / `vrm.avatar.filePort`，默认 `localhost` / `8765` / `8766`）；WS 地址由 host+port 拼出；旧版单地址键 `vrm.avatar.wsUrl` 首次启动时迁移。`resolveFileUrl(path)` 把 FilePayload 的 `/files/...` 相对路径拼成 `http://{host}:{filePort}{path}`，供大文件 HTTP 下载；
   - 重连指数退避 `min(1000·2ⁿ, 8s)`，手动断开置 `manualClose` 不再重连；
+  - 作用域销毁（`onScopeDispose`）即 disconnect 并清重连定时器——组件卸载或 Vite HMR 重挂载不留"僵尸连接"。否则旧实例的连接会在后端重启后各自重连，服务端 broadcast 的 performance 被旧表演层再播一份（声音多重播放）；
   - 非 JSON 或无 `type` 的消息直接忽略；ws 实例用 `shallowRef` 避免被代理。
 
 ### 3.3 composables/usePerformance.ts — 表演层（核心调度）
 
-- **目的**：把 performance 数组变成一场"演出"：字幕、语音、口型、情绪的时序编排。
-- **功能**：`enqueue(message)` 入队；`skip()` 跳过全部；暴露 `subtitle / currentEmotion / isPlaying` 给 UI；`setVolume / unlockAudio`。
+- **目的**：把 performance 消息变成一场"演出"：单条共享音频、字幕、口型、情绪的时序编排。
+- **功能**：`enqueue(message)` 入队（一场 = 表演段数组 + 共享音频）；`skip()` 跳过全部；暴露 `subtitle / currentEmotion / isPlaying` 给 UI；`setVolume / unlockAudio`。
 - **实现要点**：
-  - **队列语义**：逐段处理。每段先触发 `setEmotion(emotion, intensity)`（变化时延迟 600ms 让表情先过渡到位），再播放 `text` 媒体——有 `audio` 则播完 resolve，无音频按时长估算（每字 180ms，下限 1.2s 上限 8s）。段末情绪复位 neutral。队列耗尽时复位表情/口型并 `returnToIdle()`。`skip()` 递增代数（skipGeneration），等待中的段在任何 await 之后检测到代数变化即终止链路。v1.5 起 performance 段不再携带 `action`，无动画等待（`waitActionDone` 时序同步已随字段一并移除）；待机变体切换自 v1.4 起移出队列，`skip()` 亦不复位待机覆盖。
+  - **队列语义（v1.7）**：逐场处理。带音频的演出：**音频从头到尾只播一次**，单一 rAF 循环（口型 + 时间轴 + watchdog 合一）按 `el.currentTime` 推进——**情绪与字幕共用同一索引，在同一段边界同时切换**（FaceEngine 临界阻尼自带平滑过渡，不人为提前；首段在起播前就位），段间停顿保留上一段情绪/字幕，音频 `ended` 后复位 neutral。时间轴构建：全部段带有效 `start/end`（服务端词级对齐回填，重叠窗口钳到递增）才直接采用，否则等元数据拿到时长后按文本长度比例估算。无音频的演出回退逐段静音展示（每字 180ms，下限 1.2s 上限 8s，情绪变化时延迟 600ms 过渡）。队列耗尽时复位表情/口型并 `returnToIdle()`。`skip()` 递增代数（skipGeneration），等待中的演出在任何 await 之后检测到代数变化即终止链路。v1.5 起 performance 段不再携带 `action`，无动画等待；待机变体切换自 v1.4 起移出队列，`skip()` 亦不复位待机覆盖。
   - **音频链路**：`Audio(dataURL) → createMediaElementSource` 扇出到两支：`lipsyncNode`（分析支路，终端节点）+ `gainNode → destination`（播放支路，音量实际由 gain 控制）。AudioContext 必须解锁：首次 pointerdown/keydown 或点击连接时提前 resume 并预建图（wlipsync 内联 worklet 是 data: URL，Chrome 不支持，需先从 `/audio-processor.js` 加载注册 processor，再 fetch `/profile.bin` 解析 profile 创建节点）。
-  - **口型驱动循环**（rAF）：wLipSync 输出音素权重 × 归一化音量，映射 A/I/U/E/O → aa/ih/ou/ee/oh 写入场景层（faceDriver 统一写入面部 morph）；音量同步喂给 bodySway。咝音 S 无对应口型，忽略。
-  - **健壮性**：watchdog 监测 `currentTime` 卡死 3s 强制结束段；`el.src=''` 前先摘 onerror 避免伪 error；`ensureAudioGraph` 合并并发调用防 AbortError。
+  - **口型驱动**（rAF 内）：wLipSync 输出音素权重 × 归一化音量，映射 A/I/U/E/O → aa/ih/ou/ee/oh 写入场景层（faceDriver 统一写入面部 morph）；音量同步喂给 bodySway。咝音 S 无对应口型，忽略。
+  - **健壮性**：watchdog 监测 `currentTime` 卡死 3s 强制结束演出；`el.src=''` 前先摘 onerror 避免伪 error；`ensureAudioGraph` 合并并发调用防 AbortError；等待元数据超时 3s 兜底。**dispose 后实例永久停播**：`disposed` 标记拦截 `enqueue`/`unlockAudio`，防止被旧 WS 连接的消息"复活"并重建 AudioContext；skip/dispose 经 abort 句柄唤醒挂起的 `playAudioShow` Promise（cleanupAudio 摘除事件后 ended/error 不再触发，无此句柄则 Promise 永不 resolve，链路泄漏）。
 
 ### 3.4 composables/useVRMScene.ts — 场景层
 
@@ -183,12 +187,12 @@ v1.5 移除了 `expression`（模型表情名）与 `action`（一次性动画�
 | faceDriver.ts | 粘合层：拥有 FaceEngine；面部 morph 直写（口型合成 + 口型闸门）；头部姿态乘法叠加；视线角度计算；模型绑定/回退判定 |
 | engine.ts | FaceEngine（headless，移植自 Soullink）：`triggerEmotion(emotion, intensity)` → VAD 状态机（EmotionStateController：半衰期衰减/保持/逼近）→ DetailedVADMapper（VAD 径向插值出 FACS AU）→ 120Hz 定步长临界阻尼平滑输出 FrameState（AU / 眨眼 / gaze / pose / ARKit blendshapes）；自带 autoBlink（MotionTimeline 波形）与 idle 头部微动 |
 | emotions.ts | 24 词情绪目录 `emotionCatalog`（与后端 EMOTION_WORDS 逐词同步）：每词含 VAD 预设 + 作者化 AU 锚点（风格残差） |
-| morphProfile.ts | AU → 模型 morph 绑定：`vroidProfile`（ARKit 直接命名 + VRoid Fcl_* 风格化代理），`resolveProfile`（含双侧对称展开），`computeMorphWeights`（组内竞争归一 + 对比度锐化 + 眨眼压制） |
+| morphProfile.ts | AU → 模型 morph 绑定：多本命名方言词典 `bindingProfiles` 竞标（`vroidProfile`：ARKit 直接命名 + VRoid Fcl_* 风格化代理；`animeProfile`：VRChat `vrc.v_*` viseme + 作者 romaji 自定义名 + MMD 日文名，适配社区模型转 VRM），`resolveProfile`（含双侧对称展开），`computeMorphWeights`（组内竞争归一 + 对比度锐化 + 眨眼压制；Fcl 专用谓词对非 Fcl 命名自然跳过） |
 | arkit.ts | FACS AU ↔ ARKit 52 通道映射、`directShapeChannel` 命名匹配 |
 | detailed-vad.ts / directions.ts / motion.ts | VAD→AU 映射器、头部/眼睛角度限位、点头/摇头/眨眼波形时间线（引擎内部依赖） |
 | ../vendor/soullink/ | soullink-emotion-sdk 原始文件（Apache-2.0），只读不改 |
 
-- **写入策略（morph 直写 + 预设回退）**：模型加载时遍历 morph 字典解析绑定；支持 AU 数 < 4 或元音口型全部未命中 → 回退模式，改写 VRM 预设表情（happy/angry/sad/surprised/relaxed/blink + 预设元音口型），与 Soullink viewer 行为一致。直写模式下每帧先还原上一帧写过但本帧不再写的 morph，再写入本帧权重。
+- **写入策略（morph 直写 + 预设回退）**：模型加载时遍历 morph 字典，以 `bindingProfiles` 多本命名方言词典竞标解析绑定（各完整 resolve 一遍，取 supported 命中数最多者，保证模型由一套自洽命名方言驱动）；胜出词典支持 AU 数 < 4 或元音口型全部未命中 → 回退模式，改写 VRM 预设表情（happy/angry/sad/surprised/relaxed/blink + 预设元音口型），与 Soullink viewer 行为一致。直写模式下每帧先还原上一帧写过但本帧不再写的 morph，再写入本帧权重。元音 morph 候选名按「VRM 预设 → VRoid Fcl → VRChat viseme → romaji → MMD 日文」优先级解析。
 - **口型闸门（沿用旧设计）**：口型 morph 与情绪嘴部 AU 叠加会穿模；按最大元音权重计算闸门 `max(0.3, 1 − maxLip×0.7)`（指数平滑，速率 12），作用于嘴部 AU（`MOUTH_AU_RE`）后再求 morph 权重；口型 morph 与情绪嘴部 morph 同名时取 max。
 - **头部姿态叠加**：情绪头部角度（含 idle 微动）以 `bone.quaternion = mixer输出 × (faceBasis·R·faceBasis⁻¹)` 乘法偏移叠加，与 VRMA 关键帧正交；每帧 `prepareHead` 先还原上一帧偏移再叠加，无 VRMA 头部轨道时不累积。
 - **视线**：`lookAt.autoUpdate=false`，每帧计算「注视目标方向（faceBasis 逆变换到面部局部系）+ 情绪视线偏移」的 yaw/pitch（钳位 eyeLimits 30°/25°）写入 `lookAt.yaw/pitch`；bone applier 的 rangeMap 归一为恒等（请求 15° 即真实 15°）。
@@ -247,7 +251,7 @@ Offset 节点法与 faceDriver 的头部乘法偏移同源：不改写被动画�
 | StageCanvas.vue | canvas 容器 + 加载提示胶囊（expose canvas 元素供场景初始化） |
 | SubtitleBar.vue | 字幕栏：当前文本 + 情绪标签，Transition 淡入淡出 |
 | StatusBar.vue | 连接状态指示灯（绿/黄闪/红）+ 错误摘要 |
-| ControlPanel.vue | 右侧抽屉面板：服务器主机、WS 端口、文件下载端口、连接/断开、音量/静音、跳过表演、三盏灯强度、呼吸与摆动幅度滑块；全部 v-model 透传给页面的持久化 ref |
+| ControlPanel.vue | 右侧抽屉面板：服务器主机、WS 端口、文件下载端口、连接/断开、音量/静音、跳过表演、三盏灯强度、呼吸与摆动幅度滑块、口型隔离开关（调试：嘴部情绪 AU 清零，实时生效不持久化）；除口型隔离外全部 v-model 透传给页面的持久化 ref |
 
 ### 3.12 基础设施
 
@@ -259,17 +263,17 @@ Offset 节点法与 faceDriver 的头部乘法偏移同源：不改写被动画�
 
 ### 3.13 server_reference/ — 服务端参考实现（非本仓库构建产物）
 
-AstrBot 插件的三个文件，定义了客户端必须对齐的协议语义（v1.5 契约）：
+AstrBot 插件的文件，定义了客户端必须对齐的协议语义（v1.7 契约）：
 
 - **wire_types.py**：FilePayload（`filename` + `url`/`data` 二选一：大文件 url 引用，TTS 音频 base64 内嵌）。
-- **performance.py**：`Performance`（text / emotion / intensity，audio 由 TTS 步骤回填）与 `parse_performance`——LLM 输出为 JSON 数组，逐元素校验：`text` 必须是字符串且非空（否则跳过）；`emotion` 按 24 词固定情绪词表大小写不敏感匹配，词表外降级 `neutral`；`intensity` 钳制 `[0,1]`，缺省/非数值用默认 `0.85`；容忍 Markdown 代码围栏、数组外杂文、`{"performances": [...]}` 包装；整体不可解析时返回 None（上游把全文当一句台词降级）。idle 变体不属于数组，由 `set_idle` 工具带外下发。
-- **messages.py**：消息构建器。`build_performance_message` 逐段 TTS 填充 audio（一段至多一个 TTS 片段；Fish Audio TTS 把情绪以 `[emotion]` 前缀随文本送入以驱动情感韵律）；VRM/背景/VRMA 不再读文件编码 base64，改为 `_file_url` 生成插件数据目录的 `/files/<relpath>` 相对 URL（路径穿越校验保留），由插件自身的 HTTP 文件下载服务供客户端 fetch + 浏览器缓存；AnimationEntry 的 `layer`（idle/gesture/action，缺省 action）保留（gesture/action 条目暂无触发方，为未来预留）；`SetIdleMessage` 为 `set_idle` LLM 工具的带外下发通道。
+- **performance.py**：`Performance`（text / emotion / intensity 固定默认 / `start`/`end` 时间窗，由词级对齐步骤回填）与 `parse_tagged_text`——抽取 LLM 不再输出句子数组，而是**在原始回复文本中内联插入 `[emotion]` 标签**，本模块把标签文本解析回表演段列表：每个标签作用于其后至下一标签的文本，首标签前的文本默认 `neutral`；方括号 token 按词表大小写不敏感校验，非词表 token（如残留的动作描述）保留为字面文本；容忍 Markdown 代码围栏；无可表演文本时返回 None（上游把全文当一句台词降级）。idle 变体不属于列表，由 `set_idle` 工具带外下发。
+- **messages.py**：消息构建器。`build_performance_message` 把**整段回复合成一条共享 TTS 片段**（各段文本带 `[emotion]` 前缀拼接一次送入 TTS，前缀同时驱动情感韵律），再经 forced-alignment 服务对齐标签剥离后的纯文本，把词级时间匹配回各段填充 `start`/`end`；音频作为列表的兄弟字段挂在消息上（`audio: FilePayload | None`），**绝不逐段拆分**。VRM/背景/VRMA 不再读文件编码 base64，改为 `_file_url` 生成插件数据目录的 `/files/<relpath>` 相对 URL（路径穿越校验保留），由插件自身的 HTTP 文件下载服务供客户端 fetch + 浏览器缓存；AnimationEntry 的 `layer`（idle/gesture/action，缺省 action）保留（gesture/action 条目暂无触发方，为未来预留）；`SetIdleMessage` 为 `set_idle` LLM 工具的带外下发通道。
 
 ---
 
 ## 4. 关键设计决策速查
 
-1. **JSON 数组分段结构（取代事件流）**：LLM 直接输出表演段数组，服务端只做校验与 TTS 回填，不重组时序；每个 `Performance` 自带台词 + 情绪 + 强度，情绪的段作用域（段末复位 neutral）由消费方执行。待机切换为独立 `set_idle` 消息。
+1. **共享音频 + 段时间窗结构（v1.7，取代逐段音频）**：一次回复合成一条 TTS 音频（情绪以 `[emotion]` 前缀内联驱动韵律），表演段只携带文本 + 情绪 + `start/end` 时间窗；客户端音频只播一次，按时间窗切换情绪/字幕，段间无需重开销播。时间窗缺失时按文本长度比例回退估算，能力降级但不断链。待机切换为独立 `set_idle` 消息。
 2. **固定 24 词情绪词表取代模型表情名（v1.5）**：协议与模型解耦——同一份 LLM 提示词/后端配置可驱动任意 VRM；情绪表现力由前端引擎（VAD 状态机 + FACS AU + morph 绑定）保证，`intensity` 直接进入引擎的 triggerEmotion 强度参数。模型不适配时回退 VRM 预设表情，能力降级但不断链。
 3. **表情引擎 headless 移植**：FaceEngine 不含渲染/网络依赖，`triggerEmotion(emotion, intensity)` 输入、FrameState 输出；面部应用（morph 直写/回退）、头部姿态叠加、视线融合全部收敛在 faceDriver，场景层只编排调用顺序。
 4. **多 mixer 层覆盖**：用多个 AnimationMixer 的更新顺序模拟 Unity 层覆盖与遮罩（r4~r7 的原始状态管理技巧保留）。
