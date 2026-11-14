@@ -24,7 +24,7 @@ import type { VRM } from '@pixiv/three-vrm';
 import type { LipSyncWeights, VowelPreset } from '@/types/lipsync';
 import { FaceEngine, actionUnitDefinitions, type FrameState, type FACSActionUnitState } from './engine';
 import { emotionByName } from './emotions';
-import { computeMorphWeights, resolveProfile, vroidProfile, MOUTH_AU_RE, type ResolvedBinding } from './morphProfile';
+import { computeMorphWeights, resolveProfile, bindingProfiles, MOUTH_AU_RE, type ResolvedBinding } from './morphProfile';
 import { type EyeAngles } from './directions';
 
 const clamp01 = (v: number) => Math.min(1, Math.max(0, Number.isFinite(v) ? v : 0));
@@ -34,13 +34,14 @@ const LIP_EMOTION_SUPPRESS = 0.7;
 /** 情绪嘴部权重下限（说话最开口时保留的比例） */
 const EMOTION_GATE_MIN = 0.3;
 
-/** 五元音 → 模型嘴部 morph 候选名（VRM 预设名 + VRoid Fcl 命名） */
+/** 五元音 → 模型嘴部 morph 候选名（按命中优先级排列：
+ *  VRM 预设名 → VRoid Fcl 命名 → VRChat viseme → romaji 自定义 → MMD 日文） */
 const VOWEL_MORPH_CANDIDATES: Record<VowelPreset, string[]> = {
-  aa: ['aa', 'Fcl_MTH_A', 'Face.M_F00_000_Fcl_MTH_A', 'jawOpen', 'mouthOpen'],
-  ih: ['ih', 'Fcl_MTH_I', 'Face.M_F00_000_Fcl_MTH_I'],
-  ou: ['ou', 'Fcl_MTH_U', 'Face.M_F00_000_Fcl_MTH_U', 'mouthPucker'],
-  ee: ['ee', 'Fcl_MTH_E', 'Face.M_F00_000_Fcl_MTH_E'],
-  oh: ['oh', 'Fcl_MTH_O', 'Face.M_F00_000_Fcl_MTH_O'],
+  aa: ['aa', 'Fcl_MTH_A', 'Face.M_F00_000_Fcl_MTH_A', 'vrc.v_aa', 'mouth_a', 'あ', 'jawOpen', 'mouthOpen'],
+  ih: ['ih', 'Fcl_MTH_I', 'Face.M_F00_000_Fcl_MTH_I', 'vrc.v_ih', 'mouth_i', 'い'],
+  ou: ['ou', 'Fcl_MTH_U', 'Face.M_F00_000_Fcl_MTH_U', 'vrc.v_ou', 'mouth_u', 'う', 'mouthPucker'],
+  ee: ['ee', 'Fcl_MTH_E', 'Face.M_F00_000_Fcl_MTH_E', 'vrc.v_e', 'mouth_e', 'え'],
+  oh: ['oh', 'Fcl_MTH_O', 'Face.M_F00_000_Fcl_MTH_O', 'vrc.v_oh', 'mouth_o', 'お'],
 };
 
 /** faceDriver 依赖的最小表情管理器接口 */
@@ -324,9 +325,21 @@ export function useFaceDriver(): FaceDriver {
       for (const name of Object.keys(dict)) morphNames.add(name);
     });
 
-    // 解析 AU 绑定；命中不足（<4）→ 预设表情回退
-    bindings = resolveProfile(vroidProfile, morphNames);
-    fallback = bindings.filter((b) => b.supported).length < 4;
+    // 解析 AU 绑定：多本命名方言词典竞标——各完整 resolve 一遍，取命中数
+    // （supported 绑定数）最多者；谁解释该模型更好就信谁，保证每个模型由
+    // 一套自洽的命名方言驱动。最好的一本命中仍 <4 → 预设表情回退
+    let boundProfileName = '';
+    let bestCount = -1;
+    for (const profile of bindingProfiles) {
+      const resolved = resolveProfile(profile, morphNames);
+      const count = resolved.filter((b) => b.supported).length;
+      if (count > bestCount) {
+        bestCount = count;
+        bindings = resolved;
+        boundProfileName = profile.name;
+      }
+    }
+    fallback = bestCount < 4;
 
     // 解析元音口型 morph
     vowelMorphs.clear();
@@ -341,8 +354,9 @@ export function useFaceDriver(): FaceDriver {
 
     // eslint-disable-next-line no-console
     console.log('[FaceDriver] 模型绑定完成', {
+      profile: boundProfileName,
       morphs: morphNames.size,
-      supportedBindings: bindings.filter((b) => b.supported).length,
+      supportedBindings: bestCount,
       fallback,
       vowels: [...vowelMorphs.keys()],
     });

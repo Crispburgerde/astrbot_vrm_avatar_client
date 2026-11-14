@@ -187,12 +187,12 @@ v1.7 起 LLM 输出不再是无标记的 JSON 数组，而是**在原始回复�
 | faceDriver.ts | 粘合层：拥有 FaceEngine；面部 morph 直写（口型合成 + 口型闸门）；头部姿态乘法叠加；视线角度计算；模型绑定/回退判定 |
 | engine.ts | FaceEngine（headless，移植自 Soullink）：`triggerEmotion(emotion, intensity)` → VAD 状态机（EmotionStateController：半衰期衰减/保持/逼近）→ DetailedVADMapper（VAD 径向插值出 FACS AU）→ 120Hz 定步长临界阻尼平滑输出 FrameState（AU / 眨眼 / gaze / pose / ARKit blendshapes）；自带 autoBlink（MotionTimeline 波形）与 idle 头部微动 |
 | emotions.ts | 24 词情绪目录 `emotionCatalog`（与后端 EMOTION_WORDS 逐词同步）：每词含 VAD 预设 + 作者化 AU 锚点（风格残差） |
-| morphProfile.ts | AU → 模型 morph 绑定：`vroidProfile`（ARKit 直接命名 + VRoid Fcl_* 风格化代理），`resolveProfile`（含双侧对称展开），`computeMorphWeights`（组内竞争归一 + 对比度锐化 + 眨眼压制） |
+| morphProfile.ts | AU → 模型 morph 绑定：多本命名方言词典 `bindingProfiles` 竞标（`vroidProfile`：ARKit 直接命名 + VRoid Fcl_* 风格化代理；`animeProfile`：VRChat `vrc.v_*` viseme + 作者 romaji 自定义名 + MMD 日文名，适配社区模型转 VRM），`resolveProfile`（含双侧对称展开），`computeMorphWeights`（组内竞争归一 + 对比度锐化 + 眨眼压制；Fcl 专用谓词对非 Fcl 命名自然跳过） |
 | arkit.ts | FACS AU ↔ ARKit 52 通道映射、`directShapeChannel` 命名匹配 |
 | detailed-vad.ts / directions.ts / motion.ts | VAD→AU 映射器、头部/眼睛角度限位、点头/摇头/眨眼波形时间线（引擎内部依赖） |
 | ../vendor/soullink/ | soullink-emotion-sdk 原始文件（Apache-2.0），只读不改 |
 
-- **写入策略（morph 直写 + 预设回退）**：模型加载时遍历 morph 字典解析绑定；支持 AU 数 < 4 或元音口型全部未命中 → 回退模式，改写 VRM 预设表情（happy/angry/sad/surprised/relaxed/blink + 预设元音口型），与 Soullink viewer 行为一致。直写模式下每帧先还原上一帧写过但本帧不再写的 morph，再写入本帧权重。
+- **写入策略（morph 直写 + 预设回退）**：模型加载时遍历 morph 字典，以 `bindingProfiles` 多本命名方言词典竞标解析绑定（各完整 resolve 一遍，取 supported 命中数最多者，保证模型由一套自洽命名方言驱动）；胜出词典支持 AU 数 < 4 或元音口型全部未命中 → 回退模式，改写 VRM 预设表情（happy/angry/sad/surprised/relaxed/blink + 预设元音口型），与 Soullink viewer 行为一致。直写模式下每帧先还原上一帧写过但本帧不再写的 morph，再写入本帧权重。元音 morph 候选名按「VRM 预设 → VRoid Fcl → VRChat viseme → romaji → MMD 日文」优先级解析。
 - **口型闸门（沿用旧设计）**：口型 morph 与情绪嘴部 AU 叠加会穿模；按最大元音权重计算闸门 `max(0.3, 1 − maxLip×0.7)`（指数平滑，速率 12），作用于嘴部 AU（`MOUTH_AU_RE`）后再求 morph 权重；口型 morph 与情绪嘴部 morph 同名时取 max。
 - **头部姿态叠加**：情绪头部角度（含 idle 微动）以 `bone.quaternion = mixer输出 × (faceBasis·R·faceBasis⁻¹)` 乘法偏移叠加，与 VRMA 关键帧正交；每帧 `prepareHead` 先还原上一帧偏移再叠加，无 VRMA 头部轨道时不累积。
 - **视线**：`lookAt.autoUpdate=false`，每帧计算「注视目标方向（faceBasis 逆变换到面部局部系）+ 情绪视线偏移」的 yaw/pitch（钳位 eyeLimits 30°/25°）写入 `lookAt.yaw/pitch`；bone applier 的 rangeMap 归一为恒等（请求 15° 即真实 15°）。
