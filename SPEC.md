@@ -1,6 +1,6 @@
 # astrbot_vrm_avatar_client 技术规格（Spec）
 
-> 版本 1.7 · 更新于 2026-11-09 · 协议或核心机制变更时须同步更新本文档
+> 版本 1.7 · 更新于 2026-11-11 · 协议或核心机制变更时须同步更新本文档
 
 VRM 虚拟形象的浏览器端驱动客户端。通过 WebSocket 接收 AstrBot 后端推送的模型、动画与"表演"数组，在 Three.js 场景中实时渲染虚拟形象：说话（TTS 音频 + 口型同步）、情绪表情（借用 SoullinkEmotion3D 的表情控制引擎：24 词情绪词表 + VAD 状态机 + FACS AU 求解 + morph 直写）、动作与生命感动画。
 
@@ -251,7 +251,7 @@ Offset 节点法与 faceDriver 的头部乘法偏移同源：不改写被动画�
 | StageCanvas.vue | canvas 容器 + 加载提示胶囊（expose canvas 元素供场景初始化） |
 | SubtitleBar.vue | 字幕栏：当前文本 + 情绪标签，Transition 淡入淡出 |
 | StatusBar.vue | 连接状态指示灯（绿/黄闪/红）+ 错误摘要 |
-| ControlPanel.vue | 右侧抽屉面板：服务器主机、WS 端口、文件下载端口、连接/断开、音量/静音、跳过表演、三盏灯强度、呼吸与摆动幅度滑块；全部 v-model 透传给页面的持久化 ref |
+| ControlPanel.vue | 右侧抽屉面板：服务器主机、WS 端口、文件下载端口、连接/断开、音量/静音、跳过表演、三盏灯强度、呼吸与摆动幅度滑块、口型隔离开关（调试：嘴部情绪 AU 清零，实时生效不持久化）；除口型隔离外全部 v-model 透传给页面的持久化 ref |
 
 ### 3.12 基础设施
 

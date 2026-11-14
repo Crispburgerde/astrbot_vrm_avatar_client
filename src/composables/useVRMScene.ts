@@ -648,6 +648,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     setLipWeights,
     resetLipWeights,
     getLipWeights,
+    setLipIsolation: face.setLipIsolation,
     setAudioLevel,
     animator,
   };

@@ -31,6 +31,8 @@ const props = defineProps<{
   /** 说话摆动幅度（弧度）：身体偏航/俯仰、头部点头/摇头 */
   bodySwayBodyAmplitude: number;
   bodySwayHeadAmplitude: number;
+  /** 调试：口型隔离开关（true = 嘴部情绪 AU 清零，嘴部只由 wLipSync 驱动） */
+  lipIsolation: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -51,6 +53,7 @@ const emit = defineEmits<{
   'update:shoulderBreathAmplitude': [value: number];
   'update:bodySwayBodyAmplitude': [value: number];
   'update:bodySwayHeadAmplitude': [value: number];
+  'update:lipIsolation': [value: boolean];
 }>();
 
 const localHost = ref(props.host);
@@ -141,6 +144,10 @@ function onBodySwayHead(e: Event): void {
     'update:bodySwayHeadAmplitude',
     Number((e.target as HTMLInputElement).value),
   );
+}
+
+function onLipIsolation(): void {
+  emit('update:lipIsolation', !props.lipIsolation);
 }
 
 function close(): void {
@@ -382,6 +389,23 @@ const VAD_ROWS = [
             @input="onBodySwayHead"
           />
         </label>
+        <!-- 调试：口型隔离开关 -->
+        <div class="switch-row">
+          <div class="switch-row__text">
+            <span class="switch-row__label">口型隔离</span>
+            <span class="switch-row__hint">屏蔽表情↔口型作用，嘴部仅 wLipSync 驱动</span>
+          </div>
+          <button
+            class="switch"
+            :class="{ 'switch--on': lipIsolation }"
+            role="switch"
+            :aria-checked="lipIsolation"
+            :aria-label="lipIsolation ? '关闭口型隔离' : '开启口型隔离'"
+            @click="onLipIsolation"
+          >
+            <span class="switch__knob" />
+          </button>
+        </div>
       </section>
 
       <!-- 信息 -->
@@ -710,6 +734,62 @@ const VAD_ROWS = [
   border: none;
   border-radius: 50%;
   background: #fff;
+}
+
+/* 调试开关行（口型隔离） */
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--hairline);
+}
+.switch-row__text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.switch-row__label {
+  font-size: 13px;
+  color: var(--text-soft);
+}
+.switch-row__hint {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-soft);
+  opacity: 0.6;
+}
+.switch {
+  flex-shrink: 0;
+  position: relative;
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--glass-border);
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+.switch--on {
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+}
+.switch__knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.switch--on .switch__knob {
+  transform: translateX(18px);
 }
 
 .info {
