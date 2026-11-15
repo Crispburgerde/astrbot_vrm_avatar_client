@@ -1,6 +1,6 @@
 # astrbot_vrm_avatar_client 技术规格（Spec）
 
-> 版本 1.7 · 更新于 2026-11-11 · 协议或核心机制变更时须同步更新本文档
+> 版本 1.7 · 更新于 2026-11-15 · 协议或核心机制变更时须同步更新本文档
 
 VRM 虚拟形象的浏览器端驱动客户端。通过 WebSocket 接收 AstrBot 后端推送的模型、动画与"表演"数组，在 Three.js 场景中实时渲染虚拟形象：说话（TTS 音频 + 口型同步）、情绪表情（借用 SoullinkEmotion3D 的表情控制引擎：24 词情绪词表 + VAD 状态机 + FACS AU 求解 + morph 直写）、动作与生命感动画。
 
@@ -173,7 +173,7 @@ v1.7 起 LLM 输出不再是无标记的 JSON 数组，而是**在原始回复�
 ### 3.4 composables/useVRMScene.ts — 场景层
 
 - **目的**：拥有 three.js 场景的一切（渲染、相机、灯光、资源），并编排各驱动层的每帧写入顺序。
-- **功能**：init/loadVrm(ArrayBuffer)/loadBackground(URL)/loadAnimations(已解码字节列表)/setIdle/returnToIdle/setEmotion(emotion,intensity)/setLipWeights/resetLipWeights/setAudioLevel（playAction/waitActionDone 保留导出，暂无调用方）；响应式可调参数（三盏灯强度、呼吸/摆动幅度）均经 `usePersistentRef` 持久化并 watch 同步到 three 对象。
+- **功能**：init/loadVrm(ArrayBuffer)/loadBackground(URL)/loadAnimations(已解码字节列表)/setIdle/returnToIdle/setEmotion(emotion,intensity)/setLipWeights/resetLipWeights/setAudioLevel（playAction/waitActionDone 保留导出，暂无调用方）；响应式可调参数（三盏灯强度、呼吸/摆动幅度、头部朝向镜头开关）均经 `usePersistentRef` 持久化并 watch 同步到 three 对象。
 - **实现要点**：
   - 渲染器 ACES tone mapping + sRGB；粉紫半球光 + 主光 + 紫色边缘光（含默认隐藏的光源调试球）。
   - **模型加载**（委托 loadVRM）后依次：`fixEyeRenderOrder`（Koikatu 类模型瞳孔/眼白近平面网格透明排序修复）；提取内嵌表情名（仅 UI 展示，情绪驱动不再依赖）；`face.configure(vrm, gazeTarget)` 绑定表情驱动层（morph 收集、AU 绑定解析、lookAt 接管，注视目标为视线测试球或摄像机）；配置 breath/bodySway；包围盒自动取景半身像；重新绑定动画集。
@@ -184,7 +184,7 @@ v1.7 起 LLM 输出不再是无标记的 JSON 数组，而是**在原始回复�
 
 | 模块 | 目的 |
 |------|------|
-| faceDriver.ts | 粘合层：拥有 FaceEngine；面部 morph 直写（口型合成 + 口型闸门）；头部姿态乘法叠加；视线角度计算；模型绑定/回退判定 |
+| faceDriver.ts | 粘合层：拥有 FaceEngine；面部 morph 直写（口型合成 + 口型闸门）；头部姿态乘法叠加（情绪偏移 + 头部朝向镜头）；视线角度计算；模型绑定/回退判定 |
 | engine.ts | FaceEngine（headless，移植自 Soullink）：`triggerEmotion(emotion, intensity)` → VAD 状态机（EmotionStateController：半衰期衰减/保持/逼近）→ DetailedVADMapper（VAD 径向插值出 FACS AU）→ 120Hz 定步长临界阻尼平滑输出 FrameState（AU / 眨眼 / gaze / pose / ARKit blendshapes）；自带 autoBlink（MotionTimeline 波形）与 idle 头部微动 |
 | emotions.ts | 24 词情绪目录 `emotionCatalog`（与后端 EMOTION_WORDS 逐词同步）：每词含 VAD 预设 + 作者化 AU 锚点（风格残差） |
 | morphProfile.ts | AU → 模型 morph 绑定：多本命名方言词典 `bindingProfiles` 竞标（`vroidProfile`：ARKit 直接命名 + VRoid Fcl_* 风格化代理；`animeProfile`：VRChat `vrc.v_*` viseme + 作者 romaji 自定义名 + MMD 日文名，适配社区模型转 VRM），`resolveProfile`（含双侧对称展开），`computeMorphWeights`（组内竞争归一 + 对比度锐化 + 眨眼压制；Fcl 专用谓词对非 Fcl 命名自然跳过） |
@@ -194,7 +194,7 @@ v1.7 起 LLM 输出不再是无标记的 JSON 数组，而是**在原始回复�
 
 - **写入策略（morph 直写 + 预设回退）**：模型加载时遍历 morph 字典，以 `bindingProfiles` 多本命名方言词典竞标解析绑定（各完整 resolve 一遍，取 supported 命中数最多者，保证模型由一套自洽命名方言驱动）；胜出词典支持 AU 数 < 4 或元音口型全部未命中 → 回退模式，改写 VRM 预设表情（happy/angry/sad/surprised/relaxed/blink + 预设元音口型），与 Soullink viewer 行为一致。直写模式下每帧先还原上一帧写过但本帧不再写的 morph，再写入本帧权重。元音 morph 候选名按「VRM 预设 → VRoid Fcl → VRChat viseme → romaji → MMD 日文」优先级解析。
 - **口型闸门（沿用旧设计）**：口型 morph 与情绪嘴部 AU 叠加会穿模；按最大元音权重计算闸门 `max(0.3, 1 − maxLip×0.7)`（指数平滑，速率 12），作用于嘴部 AU（`MOUTH_AU_RE`）后再求 morph 权重；口型 morph 与情绪嘴部 morph 同名时取 max。
-- **头部姿态叠加**：情绪头部角度（含 idle 微动）以 `bone.quaternion = mixer输出 × (faceBasis·R·faceBasis⁻¹)` 乘法偏移叠加，与 VRMA 关键帧正交；每帧 `prepareHead` 先还原上一帧偏移再叠加，无 VRMA 头部轨道时不累积。
+- **头部姿态叠加**：情绪头部角度（含 idle 微动）以 `bone.quaternion = mixer输出 × (faceBasis·R·faceBasis⁻¹)` 乘法偏移叠加，与 VRMA 关键帧正交；每帧 `prepareHead` 先还原上一帧偏移再叠加，无 VRMA 头部轨道时不累积。**头部朝向镜头**（UI 开关，默认关，持久化）：开启时在情绪偏移之前再叠加一层指向注视目标（摄像机）的乘法偏移——以头部当前世界姿态为基准算「+Z → 目标方向」最小旋转（face 系 `setFromUnitVectors`，不经 yaw/pitch 分解，无滚转），钳位最大偏转 45°（其余交给眼球视线），指数平滑（速率 8/s，关闭时向恒等平滑回落）；基准取本帧动画输出，VRMA 头部关键帧被逐帧补偿（开启时头部稳定朝向镜头）。
 - **视线**：`lookAt.autoUpdate=false`，每帧计算「注视目标方向（faceBasis 逆变换到面部局部系）+ 情绪视线偏移」的 yaw/pitch（钳位 eyeLimits 30°/25°）写入 `lookAt.yaw/pitch`；bone applier 的 rangeMap 归一为恒等（请求 15° 即真实 15°）。
 
 ### 3.6 animation/AnimationController.ts — 四层动画系统
@@ -251,7 +251,7 @@ Offset 节点法与 faceDriver 的头部乘法偏移同源：不改写被动画�
 | StageCanvas.vue | canvas 容器 + 加载提示胶囊（expose canvas 元素供场景初始化） |
 | SubtitleBar.vue | 字幕栏：当前文本 + 情绪标签，Transition 淡入淡出 |
 | StatusBar.vue | 连接状态指示灯（绿/黄闪/红）+ 错误摘要 |
-| ControlPanel.vue | 右侧抽屉面板：服务器主机、WS 端口、文件下载端口、连接/断开、音量/静音、跳过表演、三盏灯强度、呼吸与摆动幅度滑块、口型隔离开关（调试：嘴部情绪 AU 清零，实时生效不持久化）；除口型隔离外全部 v-model 透传给页面的持久化 ref |
+| ControlPanel.vue | 右侧抽屉面板：服务器主机、WS 端口、文件下载端口、连接/断开、音量/静音、跳过表演、三盏灯强度、呼吸与摆动幅度滑块、头部朝向镜头开关、口型隔离开关（调试：嘴部情绪 AU 清零，实时生效不持久化）；除口型隔离外全部 v-model 透传给页面的持久化 ref |
 
 ### 3.12 基础设施
 

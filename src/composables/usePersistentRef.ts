@@ -20,8 +20,15 @@ export function usePersistentRef<T>(
   const deserialize =
     options?.deserialize ?? ((raw: string) => JSON.parse(raw) as T);
 
+  // 嵌入态（AstrBot WebView 等）下 localStorage 可能被禁用或抛错：
+  // 读写均容错，失败时仅失去跨会话持久化，会话内仍以 ref 值为准
   function read(): T {
-    const raw = localStorage.getItem(key);
+    let raw: string | null;
+    try {
+      raw = localStorage.getItem(key);
+    } catch {
+      return defaultValue;
+    }
     if (raw === null) return defaultValue;
     try {
       return deserialize(raw);
@@ -32,7 +39,11 @@ export function usePersistentRef<T>(
 
   const state = ref(read()) as Ref<T>;
   watch(state, (v) => {
-    localStorage.setItem(key, serialize(v));
+    try {
+      localStorage.setItem(key, serialize(v));
+    } catch {
+      // 写入失败（嵌入态等）：忽略，不影响会话内使用
+    }
   });
 
   return state;

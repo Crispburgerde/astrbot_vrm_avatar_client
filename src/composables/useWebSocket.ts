@@ -32,7 +32,13 @@ function persistentString(key: string, def: string) {
 
 /** 从旧版 wsUrl 迁移出 host / ws 端口 */
 function legacyDefaults(): { host: string; wsPort: string } {
-  const legacy = localStorage.getItem(LEGACY_URL_KEY);
+  // 嵌入态下 localStorage 可能抛错，读失败视同无旧值
+  let legacy: string | null = null;
+  try {
+    legacy = localStorage.getItem(LEGACY_URL_KEY);
+  } catch {
+    /* noop */
+  }
   if (!legacy) return { host: DEFAULT_HOST, wsPort: DEFAULT_WS_PORT };
   try {
     const u = new URL(legacy);

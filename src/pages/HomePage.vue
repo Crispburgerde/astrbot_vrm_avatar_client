@@ -184,6 +184,7 @@ function onClearCache(): void {
       v-model:body-sway-body-amplitude="scene.bodySwayBodyAmplitude.value"
       v-model:body-sway-head-amplitude="scene.bodySwayHeadAmplitude.value"
       v-model:lip-isolation="lipIsolation"
+      v-model:head-tracking="scene.headTracking.value"
       :status="ws.status.value"
       :scene-state="scene.state.value"
       :is-playing="performance.isPlaying.value"
