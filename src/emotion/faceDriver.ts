@@ -39,6 +39,17 @@ const EMOTION_GATE_MIN = 0.3;
  *  驱动，用于隔离观察口型原始效果。默认 false（正常行为），UI 可实时切换 */
 const DEFAULT_LIP_ISOLATION = false;
 
+/** 头部朝向镜头：最大偏转角（度）——超出部分由眼球视线补足 */
+const HEAD_TRACK_MAX_DEG = 45;
+/** 头部朝向镜头：指数平滑速率（1/s），越大跟随越紧 */
+const HEAD_TRACK_RATE = 8;
+/** 平滑四元数与恒等夹角低于此值（弧度）时跳过叠加（关闭后的回落终点） */
+const HEAD_TRACK_EPS = 0.01;
+/** face 系正前方单位向量（faceBasis 把 +Z 映射到模型正前） */
+const PLUS_Z = new THREE.Vector3(0, 0, 1);
+/** 恒等四元数（angleTo 求旋转角用） */
+const IDENT_QUAT = new THREE.Quaternion();
+
 /** 五元音 → 模型嘴部 morph 候选名（按命中优先级排列：
  *  VRM 预设名 → VRoid Fcl 命名 → VRChat viseme → romaji 自定义 → MMD 日文） */
 const VOWEL_MORPH_CANDIDATES: Record<VowelPreset, string[]> = {
@@ -76,6 +87,8 @@ export interface FaceDriver {
   resetLipWeights(): void;
   /** 调试：口型隔离开关——true 时嘴部情绪 AU 清零，嘴部只由 wLipSync 驱动 */
   setLipIsolation(enabled: boolean): void;
+  /** 头部朝向镜头开关：true 时头部以乘法偏移指向注视目标（钳位 45°，平滑跟随） */
+  setHeadTracking(enabled: boolean): void;
   /** 推进引擎（每帧调用；内部 120Hz 定步长） */
   update(dt: number): void;
   /** animator.update 之前调用：还原上一帧的头部姿态偏移 */
@@ -133,6 +146,13 @@ export function useFaceDriver(): FaceDriver {
   // ---- 口型隔离开关（UI 实时可切，见 setLipIsolation） ----
   let lipIsolation = DEFAULT_LIP_ISOLATION;
 
+  // ---- 头部朝向镜头（UI 实时可切，见 setHeadTracking） ----
+  let headTracking = false;
+  /** 平滑后的追踪旋转（face 系，+Z 为正前）；关闭时向恒等衰减 */
+  const headTrackQuat = new THREE.Quaternion();
+  /** update() 记录的本帧步长（applyHead 内平滑用） */
+  let lastDt = 1 / 60;
+
   // 复用向量（避免每帧分配）
   const tmpVec = new THREE.Vector3();
   const tmpVec2 = new THREE.Vector3();
@@ -173,7 +193,12 @@ export function useFaceDriver(): FaceDriver {
     lipIsolation = enabled;
   }
 
+  function setHeadTracking(enabled: boolean): void {
+    headTracking = enabled;
+  }
+
   function update(dt: number): void {
+    lastDt = dt;
     // 闸门指数平滑（约 0.1s 收敛）
     mouthGate += (mouthGateTarget - mouthGate) * Math.min(1, dt * GATE_SMOOTH_RATE);
     frame = engine.update(dt);
@@ -198,6 +223,9 @@ export function useFaceDriver(): FaceDriver {
     // 保存 mixer 输出（叠加前基准）
     headBaseQuat.copy(node.quaternion);
     headBaseSaved = true;
+    // 头部朝向镜头：先于情绪偏移叠加——追踪把面部指向注视目标，
+    // 情绪/idle 微动在其上继续生效（两层均为乘法偏移，相互正交）
+    applyHeadTrack(node);
     // 情绪头部角度（+yaw 左 / +pitch 上 / +roll 左倾，度）
     const head = frame.angles.head;
     if (head.yaw !== 0 || head.pitch !== 0 || head.roll !== 0) {
@@ -213,6 +241,48 @@ export function useFaceDriver(): FaceDriver {
       node.quaternion.multiply(tmpQuat2);
     }
     applyGaze();
+  }
+
+  /** 头部朝向镜头：以头部当前世界姿态为基准，计算「正前 → 注视目标」的
+   *  最小旋转，钳位最大偏转角并指数平滑后，以乘法偏移叠加。
+   *
+   *  用 setFromUnitVectors（+Z → face 系目标方向）构造旋转，不经过
+   *  yaw/pitch 分解——无符号歧义、不引入滚转；基准是本帧动画输出的世界
+   *  姿态，VRMA 关键帧的头部旋转会被逐帧补偿（开启时头部稳定朝向镜头）。
+   *  关闭时目标为恒等，平滑回落后不再叠加。 */
+  function applyHeadTrack(node: THREE.Object3D): void {
+    // 本帧目标（face 系）：开启时为指向注视目标的旋转，关闭时为恒等
+    const target = tmpQuat2;
+    if (headTracking && gazeTarget) {
+      // 注视方向（世界系）= 目标位置 − 头部位置
+      const dir = gazeTarget
+        .getWorldPosition(tmpVec)
+        .sub(node.getWorldPosition(tmpVec2));
+      if (dir.lengthSq() < 1e-10) {
+        target.identity();
+      } else {
+        // 世界系方向 → 头部局部系（世界姿态逆）→ face 系（+Z 为正前）
+        dir
+          .normalize()
+          .applyQuaternion(node.getWorldQuaternion(tmpQuat).invert())
+          .applyQuaternion(faceBasisInverse);
+        target.setFromUnitVectors(PLUS_Z, dir);
+        // 钳位最大偏转角：从恒等向完整旋转按比例收缩，其余交给眼球视线
+        const maxAngle = THREE.MathUtils.degToRad(HEAD_TRACK_MAX_DEG);
+        const angle = target.angleTo(IDENT_QUAT);
+        if (angle > maxAngle) {
+          tmpQuat.identity().slerp(target, maxAngle / angle);
+          target.copy(tmpQuat);
+        }
+      }
+    } else {
+      target.identity();
+    }
+    headTrackQuat.slerp(target, 1 - Math.exp(-HEAD_TRACK_RATE * lastDt));
+    if (headTrackQuat.angleTo(IDENT_QUAT) < HEAD_TRACK_EPS) return;
+    node.quaternion.multiply(
+      tmpQuat.copy(faceBasis).multiply(headTrackQuat).multiply(faceBasisInverse),
+    );
   }
 
   /** 计算视线角度并写入 lookAt（度）。
@@ -407,6 +477,8 @@ export function useFaceDriver(): FaceDriver {
     fallback = true;
     vowelMorphs.clear();
     headBaseSaved = false;
+    // 头部追踪平滑量复位（开关本身是用户偏好，不清）
+    headTrackQuat.identity();
     mouthGate = 1;
     mouthGateTarget = 1;
     (Object.keys(lipWeights) as VowelPreset[]).forEach((key) => {
@@ -420,6 +492,7 @@ export function useFaceDriver(): FaceDriver {
     setLipWeights,
     resetLipWeights,
     setLipIsolation,
+    setHeadTracking,
     update,
     prepareHead,
     applyHead,

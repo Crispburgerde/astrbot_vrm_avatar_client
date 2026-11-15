@@ -33,6 +33,8 @@ const props = defineProps<{
   bodySwayHeadAmplitude: number;
   /** 调试：口型隔离开关（true = 嘴部情绪 AU 清零，嘴部只由 wLipSync 驱动） */
   lipIsolation: boolean;
+  /** 头部朝向镜头开关（true = 头部自动转向摄像机，最多约 45°） */
+  headTracking: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -54,6 +56,7 @@ const emit = defineEmits<{
   'update:bodySwayBodyAmplitude': [value: number];
   'update:bodySwayHeadAmplitude': [value: number];
   'update:lipIsolation': [value: boolean];
+  'update:headTracking': [value: boolean];
 }>();
 
 const localHost = ref(props.host);
@@ -148,6 +151,10 @@ function onBodySwayHead(e: Event): void {
 
 function onLipIsolation(): void {
   emit('update:lipIsolation', !props.lipIsolation);
+}
+
+function onHeadTracking(): void {
+  emit('update:headTracking', !props.headTracking);
 }
 
 function close(): void {
@@ -389,6 +396,23 @@ const VAD_ROWS = [
             @input="onBodySwayHead"
           />
         </label>
+        <!-- 头部朝向镜头开关 -->
+        <div class="switch-row">
+          <div class="switch-row__text">
+            <span class="switch-row__label">头部朝向镜头</span>
+            <span class="switch-row__hint">头部自动转向摄像机，最多约 45°，其余由视线补足</span>
+          </div>
+          <button
+            class="switch"
+            :class="{ 'switch--on': headTracking }"
+            role="switch"
+            :aria-checked="headTracking"
+            :aria-label="headTracking ? '关闭头部朝向镜头' : '开启头部朝向镜头'"
+            @click="onHeadTracking"
+          >
+            <span class="switch__knob" />
+          </button>
+        </div>
         <!-- 调试：口型隔离开关 -->
         <div class="switch-row">
           <div class="switch-row__text">
@@ -736,7 +760,7 @@ const VAD_ROWS = [
   background: #fff;
 }
 
-/* 调试开关行（口型隔离） */
+/* 开关行（头部朝向镜头 / 口型隔离） */
 .switch-row {
   display: flex;
   align-items: center;

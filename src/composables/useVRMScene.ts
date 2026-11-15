@@ -33,6 +33,9 @@ const BREATH_SHOULDER_KEY = 'vrm.breath.shoulder';
 const BODYSWAY_BODY_KEY = 'vrm.bodysway.body';
 const BODYSWAY_HEAD_KEY = 'vrm.bodysway.head';
 
+/** 头部朝向镜头开关持久化存储键 */
+const HEAD_TRACKING_KEY = 'vrm.head.tracking';
+
 /** 模型当前信息 */
 export interface VRMSceneState {
   /** 是否已加载模型 */
@@ -75,6 +78,9 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   // 说话摆动幅度（响应式 + 持久化）：身体偏航/俯仰 + 头部点头/摇头（弧度）
   const bodySwayBodyAmplitude = usePersistentRef<number>(BODYSWAY_BODY_KEY, 0.03);
   const bodySwayHeadAmplitude = usePersistentRef<number>(BODYSWAY_HEAD_KEY, 0.05);
+
+  // 头部朝向镜头（响应式 + 持久化）：开启后头部自动转向注视目标（摄像机）
+  const headTracking = usePersistentRef<boolean>(HEAD_TRACKING_KEY, false);
 
   // ---- three.js 核心对象 ----
   let renderer: THREE.WebGLRenderer | null = null;
@@ -235,6 +241,12 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     });
     watch(bodySwayHeadAmplitude, (v) => {
       bodySway.setOptions({ headAmplitude: v });
+    });
+
+    // 头部朝向镜头开关 → faceDriver 实时同步（含初始值；模型重载不清偏好）
+    face.setHeadTracking(headTracking.value);
+    watch(headTracking, (v) => {
+      face.setHeadTracking(v);
     });
 
     resizeObserver = new ResizeObserver(() => handleResize());
@@ -645,6 +657,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     shoulderBreathAmplitude,
     bodySwayBodyAmplitude,
     bodySwayHeadAmplitude,
+    headTracking,
     init,
     loadVrm,
     loadBackground,
