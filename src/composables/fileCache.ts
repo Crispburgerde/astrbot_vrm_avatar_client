@@ -86,7 +86,21 @@ async function idbPut(url: string, entry: CacheEntry): Promise<void> {
 
 // ---- 统一缓存接口 ----------------------------------------------------------
 
-const hasCaches = typeof caches !== 'undefined';
+/**
+ * 嵌入态（AstrBot WebUI iframe 沙箱 / opaque origin）下，读取 window 上的
+ * caches / indexedDB 属性本身就会抛 SecurityError，typeof 拦不住 getter，
+ * 必须 try/catch 探测。
+ */
+function hasStorageApi(name: 'caches' | 'indexedDB'): boolean {
+  try {
+    return typeof window[name] !== 'undefined';
+  } catch {
+    return false;
+  }
+}
+
+const hasCaches = hasStorageApi('caches');
+const hasIdb = hasStorageApi('indexedDB');
 
 async function cacheRead(url: string): Promise<CacheEntry | null> {
   if (hasCaches) {
@@ -103,7 +117,7 @@ async function cacheRead(url: string): Promise<CacheEntry | null> {
       return null;
     }
   }
-  return idbGet(url);
+  return hasIdb ? idbGet(url) : null;
 }
 
 async function cacheWrite(
@@ -120,11 +134,13 @@ async function cacheWrite(
       warn('Cache Storage 写入失败（配额？）:', e);
     }
   }
-  await idbPut(url, {
-    etag: resp.headers.get('etag'),
-    lastModified: resp.headers.get('last-modified'),
-    buffer,
-  });
+  if (hasIdb) {
+    await idbPut(url, {
+      etag: resp.headers.get('etag'),
+      lastModified: resp.headers.get('last-modified'),
+      buffer,
+    });
+  }
 }
 
 // ---- 主入口 ----------------------------------------------------------------
@@ -137,7 +153,7 @@ async function cacheWrite(
  * 缓存后端均不可用时退化为普通 fetch。
  */
 export async function fetchBinaryWithCache(url: string): Promise<ArrayBuffer> {
-  if (!hasCaches && typeof indexedDB === 'undefined') {
+  if (!hasCaches && !hasIdb) {
     warn('无可用缓存后端（caches / indexedDB 均缺失），普通下载');
     return plainFetchBinary(url);
   }

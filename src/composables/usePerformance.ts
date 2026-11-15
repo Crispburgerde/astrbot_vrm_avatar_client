@@ -15,8 +15,9 @@ import type { LipSyncWeights, VowelPreset } from '@/types/lipsync';
  * - AUDIO_WORKLET_URL：AudioWorklet 处理器脚本
  * - LIPSYNC_PROFILE_URL：wLipSync 预计算 profile（二进制）
  */
-const AUDIO_WORKLET_URL = '/audio-processor.js';
-const LIPSYNC_PROFILE_URL = '/profile.bin';
+// 用 BASE_URL 拼相对路径：构建后为 './xxx'，嵌入任意子路径均可用（dev 下 BASE_URL 为 '/'）
+const AUDIO_WORKLET_URL = `${import.meta.env.BASE_URL}audio-processor.js`;
+const LIPSYNC_PROFILE_URL = `${import.meta.env.BASE_URL}profile.bin`;
 
 /** 静音路径：表情切换到字幕展示的延迟（毫秒），让表情先过渡到位 */
 const EXPRESSION_AUDIO_DELAY = 600;
