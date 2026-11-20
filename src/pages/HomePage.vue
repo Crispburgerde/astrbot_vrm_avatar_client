@@ -7,7 +7,10 @@ import ControlPanel from '@/components/ControlPanel.vue';
 import { useWebSocket } from '@/composables/useWebSocket';
 import { useVRMScene } from '@/composables/useVRMScene';
 import { usePerformance } from '@/composables/usePerformance';
-import { usePersistentRef } from '@/composables/usePersistentRef';
+import {
+  bootstrapClientSettings,
+  usePersistentRef,
+} from '@/composables/usePersistentRef';
 import { fetchBinaryWithCache, clearFileCache } from '@/composables/fileCache';
 import { formatToMime } from '@/lib/utils';
 import {
@@ -126,8 +129,9 @@ onMounted(() => {
   // 从子组件拿到真实 canvas 元素后初始化场景
   canvasRef.value = stageRef.value?.canvas ?? null;
   scene.init();
-  // 自动连接后端
-  ws.connect();
+  // 先完成连接引导（嵌入态经插件桥取端口 / 独立态读 localStorage）与舞台
+  // 设置拉取，再连接，避免用默认值连错后端
+  void bootstrapClientSettings().then(() => ws.connect());
 });
 
 // 组件实例类型推断占位（确保 stageRef 类型正确）
