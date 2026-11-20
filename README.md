@@ -10,7 +10,7 @@
 - **自然生命感动画** — 程序化呼吸（胸腔俯仰 + 肩部上下）、说话时身体/头部摆动（音量驱动），表情引擎自带自然眨眼与头部微动
 - **情绪表情引擎** — 移植 [SoullinkEmotion3D](https://github.com/nanlingyin/soullink-emotion-sdk)：24 词情绪词表 + VAD 状态机 + FACS AU 求解 + morph 直写；模型不适配时自动回退 VRM 预设表情
 - **WebSocket 通信** — 自动重连（指数退避），JSON 消息分发，连接状态实时显示；大文件（模型/背景/动画）经 HTTP 下载并持久缓存
-- **控制面板** — 可调节服务器主机 / WS 端口 / 文件下载端口、音量、三盏灯光强度、呼吸幅度、说话摆动幅度，所有参数自动持久化到 `localStorage`
+- **控制面板** — 可调节服务器主机 / WS 端口 / 文件下载端口、音量、三盏灯光强度、呼吸幅度、说话摆动幅度；嵌入 WebUI 时端口自动读取后端配置（无需手填），舞台参数持久化到后端 `client_settings.json`，独立部署时连接参数存浏览器 `localStorage`
 - **轨道摄像机** — 左键拖拽旋转、滚轮缩放、中键/右键平移
 - **字幕与状态栏** — 实时显示对话字幕、当前情绪、连接状态
 
@@ -52,7 +52,7 @@ npm run build
 npm run preview
 ```
 
-开发服务器启动后，浏览器打开页面即可。页面加载后会**自动连接**默认后端 `ws://localhost:8765`。服务器主机、WebSocket 端口与文件下载端口均可在页面右上角控制台自行填写，并持久化保存在浏览器 localStorage 中。
+开发服务器启动后，浏览器打开页面即可。页面加载后会**自动连接**后端：默认主机取页面自身的 hostname（本地开发即 `localhost`），端口默认 `8765` / `8766`；嵌入 AstrBot WebUI 时，端口会经插件 API 桥自动读取后端实际配置，无需手填。连接参数的改动在独立部署时保存在浏览器 `localStorage`；舞台参数（音量/灯光/幅度）保存在后端 `client_settings.json`（AstrBot 插件数据目录），跨浏览器生效。
 
 ### 连接 AstrBot 后端
 
@@ -141,7 +141,7 @@ src/
 │   ├── useWebSocket.ts        # WebSocket 通信层：连接/自动重连/消息分发/文件 URL 拼接
 │   ├── useBreath.ts           # 程序化呼吸（Offset 节点叠加）
 │   ├── useBodySway.ts         # 说话摆动（音量驱动，Offset 节点叠加）
-│   ├── usePersistentRef.ts    # localStorage 持久化 ref
+│   ├── usePersistentRef.ts    # 设置持久化：连接参数（嵌入=插件桥引导 / 独立=localStorage）+ 舞台参数（后端 client_settings）
 │   ├── fileCache.ts           # 大文件 HTTP 下载缓存（Cache Storage + 304 再验证）
 │   ├── loadVRM.ts             # VRM 文件解析与优化
 │   └── loadVRMA.ts            # VRMA 动画文件解析
@@ -190,4 +190,4 @@ public/
 | 控制面板 → 灯光 | 调节环境光 / 主光 / 边缘光强度 |
 | 控制面板 → 角色 | 调节呼吸幅度（胸腔/肩部）、说话摆动幅度（身体/头部）、口型隔离开关（调试） |
 
-> 所有控制面板参数自动保存到浏览器 `localStorage`，下次打开时自动恢复。
+> 舞台参数（音量/灯光/幅度等）自动保存到后端 `client_settings.json`（经文件下载端口读写），任意浏览器打开均生效；连接参数在嵌入 WebUI 时自动获取后端配置，独立部署时保存在浏览器 `localStorage`。

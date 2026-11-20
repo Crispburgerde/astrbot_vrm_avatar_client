@@ -1,6 +1,14 @@
 import { computed, onScopeDispose, ref, shallowRef } from 'vue';
 import type { ServerMessage } from '@/types/messages';
-import { usePersistentRef } from '@/composables/usePersistentRef';
+import {
+  DEFAULT_FILE_PORT,
+  DEFAULT_HOST,
+  DEFAULT_WS_PORT,
+  FILE_PORT_KEY,
+  HOST_KEY,
+  WS_PORT_KEY,
+  usePersistentRef,
+} from '@/composables/usePersistentRef';
 
 /** 连接状态 */
 export type ConnectionStatus =
@@ -13,56 +21,18 @@ export interface UseWebSocketOptions {
   onMessage: (msg: ServerMessage) => void;
 }
 
-const DEFAULT_HOST = 'localhost';
-const DEFAULT_WS_PORT = '8765';
-const DEFAULT_FILE_PORT = '8766';
-const HOST_KEY = 'vrm.avatar.host';
-const WS_PORT_KEY = 'vrm.avatar.wsPort';
-const FILE_PORT_KEY = 'vrm.avatar.filePort';
-/** 旧版单地址键，用于一次性迁移到 host/port */
-const LEGACY_URL_KEY = 'vrm.avatar.wsUrl';
-
-/** 字符串原样持久化（不加 JSON 引号） */
-function persistentString(key: string, def: string) {
-  return usePersistentRef<string>(key, def, {
-    serialize: (v) => v,
-    deserialize: (raw) => raw,
-  });
-}
-
-/** 从旧版 wsUrl 迁移出 host / ws 端口 */
-function legacyDefaults(): { host: string; wsPort: string } {
-  // 嵌入态下 localStorage 可能抛错，读失败视同无旧值
-  let legacy: string | null = null;
-  try {
-    legacy = localStorage.getItem(LEGACY_URL_KEY);
-  } catch {
-    /* noop */
-  }
-  if (!legacy) return { host: DEFAULT_HOST, wsPort: DEFAULT_WS_PORT };
-  try {
-    const u = new URL(legacy);
-    return {
-      host: u.hostname || DEFAULT_HOST,
-      wsPort: u.port || DEFAULT_WS_PORT,
-    };
-  } catch {
-    return { host: DEFAULT_HOST, wsPort: DEFAULT_WS_PORT };
-  }
-}
-
 /**
  * WebSocket 通信层：连接 / 自动重连 / JSON 消息分发。
  * 后端协议见 SPEC.md §2 与 server_reference/ 参考实现。
+ * 连接参数（host / 端口）的获取与持久化见 usePersistentRef.ts：嵌入态
+ * host 取页面 hostname、端口经插件 API 桥读取；独立态 localStorage。
  */
 export function useWebSocket(options: UseWebSocketOptions) {
   const status = ref<ConnectionStatus>('disconnected');
-  // 首次使用时从旧版单地址键迁移
-  const legacy = legacyDefaults();
-  const host = persistentString(HOST_KEY, legacy.host);
-  const wsPort = persistentString(WS_PORT_KEY, legacy.wsPort);
+  const host = usePersistentRef<string>(HOST_KEY, DEFAULT_HOST);
+  const wsPort = usePersistentRef<string>(WS_PORT_KEY, DEFAULT_WS_PORT);
   // 文件下载服务（HTTP 大文件）端口，当前仅存储，加载链路后续切换
-  const filePort = persistentString(FILE_PORT_KEY, DEFAULT_FILE_PORT);
+  const filePort = usePersistentRef<string>(FILE_PORT_KEY, DEFAULT_FILE_PORT);
   const url = computed(() => `ws://${host.value.trim()}:${wsPort.value.trim()}`);
   const error = ref<string>('');
 
