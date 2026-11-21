@@ -24,6 +24,55 @@ export interface AnimationFileInput {
 const LIGHT_AMBIENT_KEY = 'vrm.light.ambient';
 const LIGHT_KEY_KEY = 'vrm.light.key';
 const LIGHT_RIM_KEY = 'vrm.light.rim';
+/** 灯光颜色持久化存储键（#rrggbb 字符串） */
+const LIGHT_AMBIENT_SKY_COLOR_KEY = 'vrm.light.ambient.skyColor';
+const LIGHT_AMBIENT_GROUND_COLOR_KEY = 'vrm.light.ambient.groundColor';
+const LIGHT_KEY_COLOR_KEY = 'vrm.light.key.color';
+const LIGHT_RIM_COLOR_KEY = 'vrm.light.rim.color';
+/** 灯光位置持久化存储键（角度，单位：度） */
+const LIGHT_KEY_AZIMUTH_KEY = 'vrm.light.key.azimuth';
+const LIGHT_KEY_ELEVATION_KEY = 'vrm.light.key.elevation';
+const LIGHT_RIM_AZIMUTH_KEY = 'vrm.light.rim.azimuth';
+const LIGHT_RIM_ELEVATION_KEY = 'vrm.light.rim.elevation';
+
+/**
+ * 主光/边缘光的默认位置参数（球坐标）：
+ * 灯绕角色旋转，方位角 0° = 正前方、正值向右；仰角为灯离水平面的高度。
+ * 半径统一取 3.0（平行光的方向与距离无关，距离只影响标记球的视觉位置，
+ * 统一后两盏灯的标记球与角色等距、角度可直接对比）。默认方位/仰角与
+ * 旧版写死的直角坐标 (0.6, 2.2, 2.0) / (-1.2, 1.4, -1.0) 方向一致。
+ */
+const LIGHT_DIRECTION_RADIUS = 3.0;
+const KEY_LIGHT_DEFAULT_AZIMUTH = (Math.atan2(0.6, 2.0) * 180) / Math.PI;
+const KEY_LIGHT_DEFAULT_ELEVATION =
+  (Math.asin(2.2 / Math.sqrt(0.6 ** 2 + 2.2 ** 2 + 2.0 ** 2)) * 180) / Math.PI;
+// 边缘光默认方位角用背面区间（100~260）表示：正后偏左约 230°
+// （等价于旧 -180~180 体系里的 -130°）
+const RIM_LIGHT_DEFAULT_AZIMUTH = 230;
+const RIM_LIGHT_DEFAULT_ELEVATION =
+  (Math.asin(1.4 / Math.sqrt(1.2 ** 2 + 1.4 ** 2 + 1.0 ** 2)) * 180) / Math.PI;
+
+/** 面板推荐范围（度）：主光限制在前方、边缘光限制在背面、仰角避开脚光/顶光 */
+export const LIGHT_ANGLE_LIMITS = {
+  keyAzimuth: { min: -80, max: 80 },
+  rimAzimuth: { min: 100, max: 260 },
+  elevation: { min: 10, max: 70 },
+} as const;
+
+/** 方位角/仰角（度）→ 三维坐标（绕原点、固定半径） */
+function lightPositionFromAngles(
+  azimuthDeg: number,
+  elevationDeg: number,
+  radius: number,
+): THREE.Vector3 {
+  const az = (azimuthDeg * Math.PI) / 180;
+  const el = (elevationDeg * Math.PI) / 180;
+  return new THREE.Vector3(
+    radius * Math.cos(el) * Math.sin(az),
+    radius * Math.sin(el),
+    radius * Math.cos(el) * Math.cos(az),
+  );
+}
 
 /** 呼吸幅度持久化存储键（弧度） */
 const BREATH_CHEST_KEY = 'vrm.breath.chest';
@@ -68,6 +117,39 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   const keyLightIntensity = usePersistentRef<number>(LIGHT_KEY_KEY, 2.2);
   const rimLightIntensity = usePersistentRef<number>(LIGHT_RIM_KEY, 1.0);
 
+  // 灯光颜色（响应式 + 持久化，#rrggbb）：环境光分天空/地面两色
+  const ambientSkyColor = usePersistentRef<string>(
+    LIGHT_AMBIENT_SKY_COLOR_KEY,
+    '#ffd6ec',
+  );
+  const ambientGroundColor = usePersistentRef<string>(
+    LIGHT_AMBIENT_GROUND_COLOR_KEY,
+    '#e0d6ff',
+  );
+  const keyLightColor = usePersistentRef<string>(LIGHT_KEY_COLOR_KEY, '#fff8f2');
+  const rimLightColor = usePersistentRef<string>(LIGHT_RIM_COLOR_KEY, '#d4a5ff');
+
+  // 灯光位置（响应式 + 持久化）：方位角 + 仰角，单位度
+  const keyLightAzimuth = usePersistentRef<number>(
+    LIGHT_KEY_AZIMUTH_KEY,
+    KEY_LIGHT_DEFAULT_AZIMUTH,
+  );
+  const keyLightElevation = usePersistentRef<number>(
+    LIGHT_KEY_ELEVATION_KEY,
+    KEY_LIGHT_DEFAULT_ELEVATION,
+  );
+  const rimLightAzimuth = usePersistentRef<number>(
+    LIGHT_RIM_AZIMUTH_KEY,
+    RIM_LIGHT_DEFAULT_AZIMUTH,
+  );
+  // 旧值迁移：边缘光方位角旧版用 -180~180 体系（默认 -130°），现改为背面
+  // 区间 100~260；把小于 90° 的旧存量值 +360° 平移到等价表示，滑块才能落在新范围内
+  if (rimLightAzimuth.value < 90) rimLightAzimuth.value += 360;
+  const rimLightElevation = usePersistentRef<number>(
+    LIGHT_RIM_ELEVATION_KEY,
+    RIM_LIGHT_DEFAULT_ELEVATION,
+  );
+
   // 呼吸幅度（响应式 + 持久化）：胸腔俯仰（弧度）+ 肩部上下平移（≈ 米）
   const chestBreathAmplitude = usePersistentRef<number>(BREATH_CHEST_KEY, 0.02);
   const shoulderBreathAmplitude = usePersistentRef<number>(
@@ -93,6 +175,14 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
   // 光源位置辅助球体（调试用）
   const lightHelpers: THREE.Mesh[] = [];
   let helperGeom: THREE.SphereGeometry | null = null;
+
+  // 灯光调节可视化：从光源标记球指向角色中心的虚线（调节面板控件时临时显示）
+  const lightGizmoLines: THREE.Line[] = [];
+  const lightGizmoTimers: Array<number | null> = [];
+  // 方向线终点：角色胸口附近（平行光方向 = 位置 → 目标）
+  const LIGHT_GIZMO_TARGET = new THREE.Vector3(0, 1.1, 0);
+  // 停止调节后多久自动隐藏（毫秒）
+  const LIGHT_GIZMO_TIMEOUT_MS = 2000;
 
   // 视线跟随测试球（调试用，当前已停用）：在人物眼前左右往返飞行的微小球体，
   // 代替摄像机作为 lookAt 注视目标，用于检验视线跟随效果。
@@ -163,15 +253,37 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     camera.position.set(0, 1.35, 2.2);
 
     // 灯光：樱花粉/淡紫半球补光 + 清透柔白主光 + 梦幻紫边缘光（二次元直播间风格）
-    ambient = new THREE.HemisphereLight(0xffd6ec, 0xe0d6ff, ambientIntensity.value);
+    ambient = new THREE.HemisphereLight(
+      ambientSkyColor.value,
+      ambientGroundColor.value,
+      ambientIntensity.value,
+    );
     scene.add(ambient);
 
-    keyLight = new THREE.DirectionalLight(0xfff8f2, keyLightIntensity.value);
-    keyLight.position.set(0.6, 2.2, 2.0);
+    keyLight = new THREE.DirectionalLight(
+      keyLightColor.value,
+      keyLightIntensity.value,
+    );
+    keyLight.position.copy(
+      lightPositionFromAngles(
+        keyLightAzimuth.value,
+        keyLightElevation.value,
+        LIGHT_DIRECTION_RADIUS,
+      ),
+    );
     scene.add(keyLight);
 
-    rimLight = new THREE.DirectionalLight(0xd4a5ff, rimLightIntensity.value);
-    rimLight.position.set(-1.2, 1.4, -1.0);
+    rimLight = new THREE.DirectionalLight(
+      rimLightColor.value,
+      rimLightIntensity.value,
+    );
+    rimLight.position.copy(
+      lightPositionFromAngles(
+        rimLightAzimuth.value,
+        rimLightElevation.value,
+        LIGHT_DIRECTION_RADIUS,
+      ),
+    );
     scene.add(rimLight);
 
     // 光源位置辅助球体（调试用，颜色对应色温，与各光源一致）
@@ -179,7 +291,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
 
     const ambientHelper = new THREE.Mesh(
       helperGeom,
-      new THREE.MeshBasicMaterial({ color: 0xffd6ec }),
+      new THREE.MeshBasicMaterial({ color: ambientSkyColor.value }),
     );
     // HemisphereLight 无方向性位置，放在角色头顶上方作视觉占位
     ambientHelper.position.set(0, 2.6, 0);
@@ -188,7 +300,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
 
     const keyHelper = new THREE.Mesh(
       helperGeom,
-      new THREE.MeshBasicMaterial({ color: 0xfff8f2 }),
+      new THREE.MeshBasicMaterial({ color: keyLightColor.value }),
     );
     keyHelper.position.copy(keyLight.position);
     scene.add(keyHelper);
@@ -196,7 +308,7 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
 
     const rimHelper = new THREE.Mesh(
       helperGeom,
-      new THREE.MeshBasicMaterial({ color: 0xd4a5ff }),
+      new THREE.MeshBasicMaterial({ color: rimLightColor.value }),
     );
     rimHelper.position.copy(rimLight.position);
     scene.add(rimHelper);
@@ -204,6 +316,27 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
 
     // 默认隐藏光源辅助球体（仅调试时手动置 visible=true）
     lightHelpers.forEach((m) => (m.visible = false));
+
+    // 灯光方向指示虚线：从标记球指向角色中心，颜色跟随各光源色
+    lightHelpers.forEach((helper, i) => {
+      const geom = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(),
+        new THREE.Vector3(),
+      ]);
+      const mat = new THREE.LineDashedMaterial({
+        color: (helper.material as THREE.MeshBasicMaterial).color.getHex(),
+        dashSize: 0.06,
+        gapSize: 0.045,
+        transparent: true,
+        opacity: 0.85,
+      });
+      const line = new THREE.Line(geom, mat);
+      line.visible = false;
+      line.frustumCulled = false;
+      scene.add(line);
+      lightGizmoLines.push(line);
+      lightGizmoTimers.push(null);
+    });
 
     // 视线跟随测试球：自发光微小球体（不受灯光影响，始终清晰可见）。
     // GAZE_TEST_ENABLED = false 时不创建，视线目标自动回退为摄像机
@@ -222,10 +355,97 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     });
     watch(keyLightIntensity, (v) => {
       if (keyLight) keyLight.intensity = v;
+      flashLightGizmo(1);
     });
     watch(rimLightIntensity, (v) => {
       if (rimLight) rimLight.intensity = v;
+      flashLightGizmo(2);
     });
+
+    // 灯光调节可视化：更新方向虚线端点并临时显示，超时自动隐藏
+    function updateLightGizmoLine(index: number): void {
+      const helper = lightHelpers[index];
+      const line = lightGizmoLines[index];
+      if (!helper || !line) return;
+      const posAttr = line.geometry.getAttribute(
+        'position',
+      ) as THREE.BufferAttribute;
+      posAttr.setXYZ(0, helper.position.x, helper.position.y, helper.position.z);
+      posAttr.setXYZ(1, LIGHT_GIZMO_TARGET.x, LIGHT_GIZMO_TARGET.y, LIGHT_GIZMO_TARGET.z);
+      posAttr.needsUpdate = true;
+      line.computeLineDistances();
+    }
+    function flashLightGizmo(index: number): void {
+      if (!lightHelpers[index] || !lightGizmoLines[index]) return;
+      updateLightGizmoLine(index);
+      lightHelpers[index].visible = true;
+      lightGizmoLines[index].visible = true;
+      const prev = lightGizmoTimers[index];
+      if (prev !== null) window.clearTimeout(prev);
+      lightGizmoTimers[index] = window.setTimeout(() => {
+        if (lightHelpers[index]) lightHelpers[index].visible = false;
+        if (lightGizmoLines[index]) lightGizmoLines[index].visible = false;
+        lightGizmoTimers[index] = null;
+      }, LIGHT_GIZMO_TIMEOUT_MS);
+    }
+
+    // 颜色 → 灯光 + 标记球 + 方向虚线实时同步
+    watch(ambientSkyColor, (v) => {
+      if (ambient) ambient.color.set(v);
+      (lightHelpers[0]?.material as THREE.MeshBasicMaterial | undefined)?.color.set(
+        v,
+      );
+      (lightGizmoLines[0]?.material as THREE.LineDashedMaterial | undefined)?.color.set(
+        v,
+      );
+    });
+    watch(ambientGroundColor, (v) => {
+      if (ambient) ambient.groundColor.set(v);
+    });
+    watch(keyLightColor, (v) => {
+      if (keyLight) keyLight.color.set(v);
+      (lightHelpers[1]?.material as THREE.MeshBasicMaterial | undefined)?.color.set(
+        v,
+      );
+      (lightGizmoLines[1]?.material as THREE.LineDashedMaterial | undefined)?.color.set(
+        v,
+      );
+      flashLightGizmo(1);
+    });
+    watch(rimLightColor, (v) => {
+      if (rimLight) rimLight.color.set(v);
+      (lightHelpers[2]?.material as THREE.MeshBasicMaterial | undefined)?.color.set(
+        v,
+      );
+      (lightGizmoLines[2]?.material as THREE.LineDashedMaterial | undefined)?.color.set(
+        v,
+      );
+      flashLightGizmo(2);
+    });
+
+    // 位置（方位角/仰角）→ 灯光 + 标记球实时同步，并闪现方向虚线
+    function syncKeyLightPosition(): void {
+      const p = lightPositionFromAngles(
+        keyLightAzimuth.value,
+        keyLightElevation.value,
+        LIGHT_DIRECTION_RADIUS,
+      );
+      keyLight?.position.copy(p);
+      lightHelpers[1]?.position.copy(p);
+      flashLightGizmo(1);
+    }
+    function syncRimLightPosition(): void {
+      const p = lightPositionFromAngles(
+        rimLightAzimuth.value,
+        rimLightElevation.value,
+        LIGHT_DIRECTION_RADIUS,
+      );
+      rimLight?.position.copy(p);
+      lightHelpers[2]?.position.copy(p);
+      flashLightGizmo(2);
+    }
+    watch([keyLightAzimuth, keyLightElevation], syncKeyLightPosition);
+    watch([rimLightAzimuth, rimLightElevation], syncRimLightPosition);
 
     // 响应式 → 呼吸幅度实时同步（滑块调节即时生效，无需重新绑定模型）
     watch(chestBreathAmplitude, (v) => {
@@ -630,6 +850,17 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     lightHelpers.length = 0;
     helperGeom?.dispose();
     helperGeom = null;
+    // 清理灯光方向虚线与自动隐藏定时器
+    lightGizmoTimers.forEach((t) => {
+      if (t !== null) window.clearTimeout(t);
+    });
+    lightGizmoTimers.length = 0;
+    lightGizmoLines.forEach((l) => {
+      scene.remove(l);
+      l.geometry.dispose();
+      (l.material as THREE.Material).dispose();
+    });
+    lightGizmoLines.length = 0;
     // 清理视线跟随测试球
     if (gazeTestTarget) {
       scene.remove(gazeTestTarget);
@@ -653,6 +884,14 @@ export function useVRMScene(canvasRef: Ref<HTMLCanvasElement | null>) {
     ambientIntensity,
     keyLightIntensity,
     rimLightIntensity,
+    ambientSkyColor,
+    ambientGroundColor,
+    keyLightColor,
+    rimLightColor,
+    keyLightAzimuth,
+    keyLightElevation,
+    rimLightAzimuth,
+    rimLightElevation,
     chestBreathAmplitude,
     shoulderBreathAmplitude,
     bodySwayBodyAmplitude,
