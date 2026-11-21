@@ -3,6 +3,7 @@ import { ref, watch } from 'vue';
 import { Settings, Power, Volume2, VolumeX, SkipForward } from 'lucide-vue-next';
 import type { ConnectionStatus } from '@/composables/useWebSocket';
 import type { VRMSceneState } from '@/composables/useVRMScene';
+import { LIGHT_ANGLE_LIMITS } from '@/composables/useVRMScene';
 import type { FaceEmotionState } from '@/emotion/faceDriver';
 
 // 多根节点（FAB + Transition 抽屉）组件：关闭透传属性自动继承，
@@ -25,6 +26,16 @@ const props = defineProps<{
   ambientIntensity: number;
   keyLightIntensity: number;
   rimLightIntensity: number;
+  /** 三盏灯的颜色（#rrggbb）：环境光分天空/地面两色 */
+  ambientSkyColor: string;
+  ambientGroundColor: string;
+  keyLightColor: string;
+  rimLightColor: string;
+  /** 主光/边缘光的位置（角度，单位：度）：方位角（左右绕圈）+ 仰角（高低） */
+  keyLightAzimuth: number;
+  keyLightElevation: number;
+  rimLightAzimuth: number;
+  rimLightElevation: number;
   /** 呼吸幅度（弧度）：胸腔俯仰、肩部俯仰 */
   chestBreathAmplitude: number;
   shoulderBreathAmplitude: number;
@@ -51,6 +62,14 @@ const emit = defineEmits<{
   'update:ambientIntensity': [value: number];
   'update:keyLightIntensity': [value: number];
   'update:rimLightIntensity': [value: number];
+  'update:ambientSkyColor': [value: string];
+  'update:ambientGroundColor': [value: string];
+  'update:keyLightColor': [value: string];
+  'update:rimLightColor': [value: string];
+  'update:keyLightAzimuth': [value: number];
+  'update:keyLightElevation': [value: number];
+  'update:rimLightAzimuth': [value: number];
+  'update:rimLightElevation': [value: number];
   'update:chestBreathAmplitude': [value: number];
   'update:shoulderBreathAmplitude': [value: number];
   'update:bodySwayBodyAmplitude': [value: number];
@@ -113,6 +132,41 @@ function onKeyLight(e: Event): void {
 }
 function onRimLight(e: Event): void {
   emit('update:rimLightIntensity', Number((e.target as HTMLInputElement).value));
+}
+
+// 灯光颜色取色器
+function onAmbientSkyColor(e: Event): void {
+  emit('update:ambientSkyColor', (e.target as HTMLInputElement).value);
+}
+function onAmbientGroundColor(e: Event): void {
+  emit('update:ambientGroundColor', (e.target as HTMLInputElement).value);
+}
+function onKeyLightColor(e: Event): void {
+  emit('update:keyLightColor', (e.target as HTMLInputElement).value);
+}
+function onRimLightColor(e: Event): void {
+  emit('update:rimLightColor', (e.target as HTMLInputElement).value);
+}
+
+// 灯光位置滑块（度数）
+function onKeyLightAzimuth(e: Event): void {
+  emit('update:keyLightAzimuth', Number((e.target as HTMLInputElement).value));
+}
+function onKeyLightElevation(e: Event): void {
+  emit('update:keyLightElevation', Number((e.target as HTMLInputElement).value));
+}
+function onRimLightAzimuth(e: Event): void {
+  emit('update:rimLightAzimuth', Number((e.target as HTMLInputElement).value));
+}
+function onRimLightElevation(e: Event): void {
+  emit('update:rimLightElevation', Number((e.target as HTMLInputElement).value));
+}
+
+// 灯光角度推荐范围（与场景层共用一份常量）
+const { keyAzimuth, rimAzimuth, elevation } = LIGHT_ANGLE_LIMITS;
+/** 值 → 滑块轨道填充百分比 */
+function pct(value: number, min: number, max: number): string {
+  return ((value - min) / (max - min)) * 100 + '%';
 }
 
 // 呼吸幅度滑块
@@ -283,6 +337,8 @@ const VAD_ROWS = [
       <!-- 灯光 -->
       <section class="block">
         <h3 class="block__title">灯光</h3>
+
+        <!-- 环境光：强度 + 天空/地面两色（无方向，不可调位置） -->
         <label class="light">
           <span class="light__label">环境光</span>
           <span class="light__value">{{ ambientIntensity.toFixed(2) }}</span>
@@ -297,7 +353,29 @@ const VAD_ROWS = [
             @input="onAmbient"
           />
         </label>
-        <label class="light">
+        <div class="light-extra">
+          <label class="color-row">
+            <span class="color-row__label">天空色</span>
+            <input
+              class="color-row__input"
+              type="color"
+              :value="ambientSkyColor"
+              @input="onAmbientSkyColor"
+            />
+          </label>
+          <label class="color-row">
+            <span class="color-row__label">地面色</span>
+            <input
+              class="color-row__input"
+              type="color"
+              :value="ambientGroundColor"
+              @input="onAmbientGroundColor"
+            />
+          </label>
+        </div>
+
+        <!-- 主光：强度 + 颜色 + 位置（方位/仰角） -->
+        <label class="light light--group-top">
           <span class="light__label">主光</span>
           <span class="light__value">{{ keyLightIntensity.toFixed(2) }}</span>
           <input
@@ -311,7 +389,48 @@ const VAD_ROWS = [
             @input="onKeyLight"
           />
         </label>
-        <label class="light">
+        <div class="light-extra">
+          <label class="color-row">
+            <span class="color-row__label">颜色</span>
+            <input
+              class="color-row__input"
+              type="color"
+              :value="keyLightColor"
+              @input="onKeyLightColor"
+            />
+          </label>
+          <label class="light">
+            <span class="light__label">方位</span>
+            <span class="light__value">{{ keyLightAzimuth.toFixed(0) }}°</span>
+            <input
+              class="light__slider"
+              type="range"
+              :min="keyAzimuth.min"
+              :max="keyAzimuth.max"
+              step="1"
+              :value="keyLightAzimuth"
+              :style="{ '--p': pct(keyLightAzimuth, keyAzimuth.min, keyAzimuth.max) }"
+              @input="onKeyLightAzimuth"
+            />
+          </label>
+          <label class="light">
+            <span class="light__label">高低</span>
+            <span class="light__value">{{ keyLightElevation.toFixed(0) }}°</span>
+            <input
+              class="light__slider"
+              type="range"
+              :min="elevation.min"
+              :max="elevation.max"
+              step="1"
+              :value="keyLightElevation"
+              :style="{ '--p': pct(keyLightElevation, elevation.min, elevation.max) }"
+              @input="onKeyLightElevation"
+            />
+          </label>
+        </div>
+
+        <!-- 边缘光：强度 + 颜色 + 位置（方位/仰角） -->
+        <label class="light light--group-top">
           <span class="light__label">边缘光</span>
           <span class="light__value">{{ rimLightIntensity.toFixed(2) }}</span>
           <input
@@ -325,6 +444,45 @@ const VAD_ROWS = [
             @input="onRimLight"
           />
         </label>
+        <div class="light-extra">
+          <label class="color-row">
+            <span class="color-row__label">颜色</span>
+            <input
+              class="color-row__input"
+              type="color"
+              :value="rimLightColor"
+              @input="onRimLightColor"
+            />
+          </label>
+          <label class="light">
+            <span class="light__label">方位</span>
+            <span class="light__value">{{ rimLightAzimuth.toFixed(0) }}°</span>
+            <input
+              class="light__slider"
+              type="range"
+              :min="rimAzimuth.min"
+              :max="rimAzimuth.max"
+              step="1"
+              :value="rimLightAzimuth"
+              :style="{ '--p': pct(rimLightAzimuth, rimAzimuth.min, rimAzimuth.max) }"
+              @input="onRimLightAzimuth"
+            />
+          </label>
+          <label class="light">
+            <span class="light__label">高低</span>
+            <span class="light__value">{{ rimLightElevation.toFixed(0) }}°</span>
+            <input
+              class="light__slider"
+              type="range"
+              :min="elevation.min"
+              :max="elevation.max"
+              step="1"
+              :value="rimLightElevation"
+              :style="{ '--p': pct(rimLightElevation, elevation.min, elevation.max) }"
+              @input="onRimLightElevation"
+            />
+          </label>
+        </div>
       </section>
 
       <!-- 角色 -->
@@ -721,6 +879,42 @@ const VAD_ROWS = [
   margin-bottom: 12px;
 }
 .light:last-child { margin-bottom: 0; }
+/* 同一盏灯的附属调节（颜色/位置）缩进成组，与下一盏灯拉开距离 */
+.light--group-top { margin-top: 14px; }
+.light-extra {
+  padding: 2px 0 4px 8px;
+  margin-bottom: 12px;
+  border-left: 2px solid var(--hairline);
+}
+.light-extra .light { margin-bottom: 10px; }
+.light-extra .light:last-child { margin-bottom: 0; }
+.light-extra .light__label { font-size: 12px; opacity: 0.85; }
+
+/* 颜色取色器行 */
+.color-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.color-row__label {
+  font-size: 12px;
+  color: var(--text-soft);
+  opacity: 0.85;
+}
+.color-row__input {
+  width: 46px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 7px;
+  background: transparent;
+  cursor: pointer;
+}
+.color-row__input::-webkit-color-swatch-wrapper { padding: 2px; }
+.color-row__input::-webkit-color-swatch { border: none; border-radius: 5px; }
+.color-row__input::-moz-color-swatch { border: none; border-radius: 5px; }
 .light__label {
   font-size: 13px;
   color: var(--text-soft);

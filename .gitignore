@@ -26,3 +26,6 @@ dist-ssr
 
 # Vite 临时文件
 *.timestamp-*.mjs
+
+# 仅本地保留
+AGENTS.md
